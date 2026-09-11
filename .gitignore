@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Build and compiled outputs
+dist/
+build/
+
+# Logs
+logs/
+*.log
+*.log.gz
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Uploads & temporary media
+uploads/
+uploads/*
+!uploads/.gitkeep
+tmp/
+temp/
+
+# Coverage and testing
+coverage/
+.nyc_output/
+
+# Local utility scripts
+clean_tarik_db.js
+
+# Local documentation & tracking files
+backend-update-track.md
+AGENTS.md
+*-track.md
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo

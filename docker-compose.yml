@@ -1,0 +1,121 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: tarik-app
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      - PAYMENT_SIMULATOR_URL=http://payment-simulator:5099/simulator/v1/checkout
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      payment-simulator:
+        condition: service_started
+    restart: unless-stopped
+
+  payment-simulator:
+    image: node:20-alpine
+    container_name: tarik-payment-simulator
+    working_dir: /app
+    entrypoint: ["sh", "-c", "npm install && node index.js"]
+    ports:
+      - "5099:5099"
+    volumes:
+      - ../tarik-payment-simulator:/app
+    environment:
+      - PORT=5099
+      - BACKEND_WEBHOOK_URL=http://app:5000/api/v1/payment/webhook
+      - SIMULATOR_HOST=192.168.0.200:5099
+    restart: unless-stopped
+
+  # ─── Development override ──────────────────────────────
+  app-dev:
+    profiles: ["dev"]
+    image: node:20-alpine
+    container_name: tarik-app-dev
+    working_dir: /app
+    entrypoint: ["sh", "-c", "corepack enable && corepack prepare pnpm@9.15.0 --activate && pnpm install && pnpm dev"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/dist
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=development
+      - MINIO_ENDPOINT=minio
+      - MINIO_PORT=9000
+      - MINIO_BASE_URL=http://minio:9000
+      - MINIO_PUBLIC_URL=http://192.168.0.200:9004
+      - API_BASE_URL=http://192.168.0.200:5000
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    container_name: tarik-mongo
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: tarik-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: tarik-minio
+    ports:
+      - "9004:9000"
+      - "9005:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
+  redis-data:
+  minio_data:
