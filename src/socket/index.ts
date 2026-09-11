@@ -15,11 +15,23 @@ let ioInstance: Server | null = null;
 let pubClient: RedisClientType | null = null;
 let subClient: RedisClientType | null = null;
 
-const getAllowedOrigins = () => {
-  if (config.node_env === "production") {
-    return ["https://yourdomain.com"];
-  }
-  return ["http://localhost:3000", "http://localhost:3001"];
+const getAllowedOrigins = (): string[] => {
+  const configured = config.cors.origin
+    ? config.cors.origin.split(",").map((o: string) => o.trim()).filter(Boolean)
+    : [];
+
+  const defaults = [
+    "https://tarikapp.joura.info",
+    "https://tarikappapi.joura.info",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:3002",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://127.0.0.1:3002",
+  ];
+
+  return Array.from(new Set([...configured, ...defaults]));
 };
 
 const attachRedisAdapter = async (io: Server) => {

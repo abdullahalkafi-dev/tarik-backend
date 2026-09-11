@@ -30,20 +30,38 @@ app.set("trust proxy", 1);
 app.use(helmetConfig);
 
 // 3. CORS
-const allowedOrigins =
-  config.node_env === "production"
-    ? ["https://yourdomain.com"]
-    : [
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:3001",
-      ];
+const getAllowedOrigins = (): string[] => {
+  const configured = config.cors.origin
+    ? config.cors.origin.split(",").map((o: string) => o.trim()).filter(Boolean)
+    : [];
+
+  const defaults = [
+    "https://tarikapp.joura.info",
+    "https://tarikappapi.joura.info",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:3002",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://127.0.0.1:3002",
+  ];
+
+  return Array.from(new Set([...configured, ...defaults]));
+};
 
 app.use(
   cors({
-    origin: allowedOrigins,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    origin: (origin, callback) => {
+      // Allow requests with no origin (e.g. mobile apps, Postman, curl)
+      if (!origin) return callback(null, true);
+      const allowed = getAllowedOrigins();
+      if (allowed.includes(origin) || allowed.includes("*")) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
     credentials: true,
     maxAge: 86400,
   }),
