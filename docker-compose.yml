@@ -34,7 +34,7 @@ services:
     environment:
       - PORT=5099
       - BACKEND_WEBHOOK_URL=http://app:5000/api/v1/payment/webhook
-      - SIMULATOR_HOST=192.168.0.200:5099
+      - SIMULATOR_HOST=${SIMULATOR_HOST:-tarikappapi.joura.info}
     restart: unless-stopped
 
   # ─── Development override ──────────────────────────────
