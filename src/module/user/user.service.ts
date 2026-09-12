@@ -107,19 +107,46 @@ const updateProfile = async (
     };
   }
 
-  const user = await UserRepository.updateById(userId, updateData);
-  if (!user) {
+  const existingUser = await UserRepository.findById(userId);
+  if (!existingUser) {
     throw new AppError(StatusCodes.NOT_FOUND, "User not found");
   }
 
-  if (payload.email && user.auth) {
-    await AuthRepository.updateById(String(user.auth), { email: payload.email });
+  // Email must be unique across auth accounts
+  if (payload.email && existingUser.auth) {
+    const normalizedEmail = String(payload.email).trim().toLowerCase();
+    const existing = await AuthRepository.findOne({ email: normalizedEmail }) as any;
+    if (existing && String(existing._id) !== String(existingUser.auth)) {
+      throw new AppError(
+        StatusCodes.BAD_REQUEST,
+        "This email is already registered",
+      );
+    }
+  }
+
+  // Phone is unique — block changing it via profile update
+  if (payload.phone != null && existingUser.phone && payload.phone !== existingUser.phone) {
+    throw new AppError(
+      StatusCodes.BAD_REQUEST,
+      "Phone number cannot be changed",
+    );
+  }
+
+  const updatedUser = await UserRepository.updateById(userId, updateData);
+  if (!updatedUser) {
+    throw new AppError(StatusCodes.NOT_FOUND, "User not found");
+  }
+
+  if (payload.email && updatedUser.auth) {
+    await AuthRepository.updateById(String(updatedUser.auth), {
+      email: String(payload.email).trim().toLowerCase(),
+    });
   }
 
   // Invalidate cache
   await cacheService.deleteCache(buildCacheKey("user", "me", userId));
 
-  return user;
+  return updatedUser;
 };
 
 // ─── Update Location ────────────────────────────────────
