@@ -1,5 +1,6 @@
 import { StatusCodes } from "http-status-codes";
 import AppError from "errors/AppError";
+import config from "config";
 import { PaymentRepository } from "./payment.repository";
 import { OrderType, PaymentStatus } from "./payment.interface";
 import { UserRepository } from "../user/user.repository";
@@ -51,7 +52,7 @@ const initializePayment = async (userId: string, payload: TInitPaymentPayload) =
           currency: "MAD",
           orderId,
           orderType,
-          returnUrl: returnUrl || "http://localhost:5000/api/v1/payment/callback",
+          returnUrl: returnUrl || `${config.urls.api_base_url}/api/v1/payment/callback`,
           metadata: { ...metadata, userId },
         }),
       });
@@ -70,10 +71,11 @@ const initializePayment = async (userId: string, payload: TInitPaymentPayload) =
   // 2. If external simulator was unreachable, generate direct simulation session
   if (!simData || !simData.success) {
     const fallbackSessionId = "sim_sess_" + Date.now() + "_" + Math.random().toString(36).substring(2, 9);
+    const publicHost = config.urls.api_base_url.replace(/\/api\/v1\/?$/, "");
     simData = {
       success: true,
       sessionId: fallbackSessionId,
-      checkoutUrl: `http://192.168.0.200:5099/checkout?sessionId=${fallbackSessionId}`,
+      checkoutUrl: `${publicHost}/checkout?sessionId=${fallbackSessionId}`,
       session: { metadata: { ...metadata, userId } },
     };
   }
@@ -436,11 +438,30 @@ const refundJobPayment = async (
 };
 
 // ─── Callback Handler (Redirect from Simulator) ──────────
-const handleCallback = async (query: { status?: string; transactionId?: string; orderId?: string }) => {
+const handleCallback = async (query: { status?: string; transactionId?: string; orderId?: string; orderType?: string }) => {
+  let orderType = query.orderType;
+
+  // Fallback: If orderType was omitted from query, resolve from PaymentRepository
+  if (!orderType) {
+    try {
+      let existing = null;
+      if (query.orderId) {
+        existing = await PaymentRepository.findByOrderId(query.orderId);
+      }
+      if (!existing && query.transactionId) {
+        existing = await PaymentRepository.findByTransactionId(query.transactionId);
+      }
+      if (existing) {
+        orderType = existing.orderType;
+      }
+    } catch (_) {}
+  }
+
   return {
     status: query.status || "completed",
     transactionId: query.transactionId || "",
     orderId: query.orderId || "",
+    orderType: orderType || "",
     message: query.status === "success" ? "Payment successful!" : "Payment failed or cancelled.",
   };
 };

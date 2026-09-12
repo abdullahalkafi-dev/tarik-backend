@@ -81,12 +81,15 @@ const handleCallback = catchAsync(async (req: Request, res: Response) => {
         <div class="icon-box">${isApproved ? '✓' : 'ℹ'}</div>
         <h1>${isApproved ? 'Verification Approved!' : 'Verification Complete'}</h1>
         <p>${isApproved ? 'Your identity has been successfully verified. You can now return to the Tarik app.' : 'Your identity documents have been submitted. Please return to the Tarik app to continue.'}</p>
-        <button class="btn" onclick="window.close()">Return to App</button>
+        <a href="tarik://didit/callback?sessionId=${encodeURIComponent(sessionId || "")}&status=${encodeURIComponent(status)}" class="btn">Return to Tarik App</a>
+        <p style="font-size: 12px; color: #64748B; margin-top: 16px;">Returning to app automatically...</p>
       </div>
       <script>
         setTimeout(() => {
-          try { window.close(); } catch(e) {}
-        }, 1500);
+          try {
+            window.location.href = "tarik://didit/callback?sessionId=${encodeURIComponent(sessionId || "")}&status=${encodeURIComponent(status)}";
+          } catch(e) {}
+        }, 300);
       </script>
     </body>
     </html>

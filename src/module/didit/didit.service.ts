@@ -76,6 +76,8 @@ const createSession = async (userId: string) => {
         workflow_id: config.didit.workflow_id,
         vendor_data: String(userId),
         callback: `${config.urls.api_base_url}/api/v1/webhooks/didit`,
+        redirect_url: `${config.urls.api_base_url}/api/v1/webhooks/didit`,
+        return_url: `${config.urls.api_base_url}/api/v1/webhooks/didit`,
       }),
     });
 

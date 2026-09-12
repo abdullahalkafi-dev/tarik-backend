@@ -25,4 +25,13 @@ router.post("/sync", auth(), DiditController.syncSession);
  */
 router.post("/webhook", DiditController.handleWebhook);
 
+/**
+ * @route   GET /api/v1/didit/webhook
+ * @route   GET /api/v1/didit/callback
+ * @desc    Browser redirect completion endpoint from Didit KYC flow
+ * @access  Public
+ */
+router.get("/webhook", DiditController.handleCallback);
+router.get("/callback", DiditController.handleCallback);
+
 export const DiditRoutes = router;
