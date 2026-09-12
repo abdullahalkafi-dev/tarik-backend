@@ -86,8 +86,15 @@ const updateProfile = async (
     latitude?: number;
   },
 ) => {
-  const { longitude, latitude, profilePhotos, ...rest } = payload;
+  const { longitude, latitude, profilePhotos, email: emailPayload, ...rest } = payload;
+  // Empty email means "leave unchanged" — email is optional for clients.
+  const email = emailPayload && String(emailPayload).trim() !== ""
+    ? String(emailPayload).trim()
+    : undefined;
   const updateData: Record<string, any> = { ...rest };
+  if (email) {
+    updateData.email = email;
+  }
 
   if (profilePhotos && Array.isArray(profilePhotos)) {
     // If incoming photos contain full URLs (e.g. from existing profile state), strip back to key
@@ -113,8 +120,8 @@ const updateProfile = async (
   }
 
   // Email must be unique across auth accounts
-  if (payload.email && existingUser.auth) {
-    const normalizedEmail = String(payload.email).trim().toLowerCase();
+  if (email && existingUser.auth) {
+    const normalizedEmail = email.toLowerCase();
     const existing = await AuthRepository.findOne({ email: normalizedEmail }) as any;
     if (existing && String(existing._id) !== String(existingUser.auth)) {
       throw new AppError(
@@ -137,9 +144,9 @@ const updateProfile = async (
     throw new AppError(StatusCodes.NOT_FOUND, "User not found");
   }
 
-  if (payload.email && updatedUser.auth) {
+  if (email && updatedUser.auth) {
     await AuthRepository.updateById(String(updatedUser.auth), {
-      email: String(payload.email).trim().toLowerCase(),
+      email: email.toLowerCase(),
     });
   }
 

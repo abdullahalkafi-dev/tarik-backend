@@ -4,7 +4,11 @@ const updateProfileDto = z.object({
   body: z
     .object({
       name: z.string().trim().min(1).max(100).optional(),
-      email: z.string().trim().email().optional(),
+      // Empty string means "leave email unchanged" (optional for clients).
+      email: z.preprocess(
+        (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+        z.string().trim().email().optional(),
+      ),
       bio: z.string().trim().max(500).optional(),
       phone: z.string().trim().min(1).max(20).optional(),
       address: z.string().trim().max(500).optional(),

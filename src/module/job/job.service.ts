@@ -464,6 +464,7 @@ const getMyBookings = async (userId: string) => {
   );
 
   const active: any[] = [];
+  const awaiting: any[] = [];
   const completedRaw: any[] = [];
   const cancelled: any[] = [];
   const unpaid: any[] = [];
@@ -475,6 +476,9 @@ const getMyBookings = async (userId: string) => {
       cancelled.push(job);
     } else if (job.status === JobStatus.PENDING_PAYMENT) {
       unpaid.push(job);
+    } else if (job.status === JobStatus.OPEN) {
+      // Posted & paid, still looking for a helper — not "active" yet.
+      awaiting.push(job);
     } else {
       active.push(job);
     }
@@ -482,7 +486,7 @@ const getMyBookings = async (userId: string) => {
 
   const completed = await attachMyReviews(completedRaw, userId);
 
-  return { active, completed, cancelled, unpaid };
+  return { active, awaiting, completed, cancelled, unpaid };
 };
 
 // ─── Get Helper's Assigned Jobs ─────────────────────────
