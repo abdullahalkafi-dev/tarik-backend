@@ -28,11 +28,13 @@ const reverseGeocode = async (
   lon: number,
 ): Promise<ReverseGeocodeResult> => {
   try {
-    const url = new URL(`${config.locationiq.base_url}/reverse`);
-    url.searchParams.append("key", config.locationiq.api_key);
-    url.searchParams.append("lat", String(lat));
-    url.searchParams.append("lon", String(lon));
-    url.searchParams.append("format", "json");
+    const url = new URL(
+      config.here.revgeocode_base_url.endsWith("/revgeocode")
+        ? config.here.revgeocode_base_url
+        : `${config.here.revgeocode_base_url}/revgeocode`,
+    );
+    url.searchParams.append("at", `${lat},${lon}`);
+    url.searchParams.append("apiKey", config.here.api_key);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -44,33 +46,43 @@ const reverseGeocode = async (
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      logger.warn(`LocationIQ reverse geocode failed: ${response.status}`);
+      logger.warn(`HERE reverse geocode failed: ${response.status}`);
       return {};
     }
 
     const data = (await response.json()) as {
-      display_name?: string;
-      lat?: string;
-      lon?: string;
-      address?: {
-        city?: string;
-        town?: string;
-        village?: string;
-        postcode?: string;
-        state?: string;
-        country?: string;
-      };
+      items?: Array<{
+        title?: string;
+        address?: {
+          label?: string;
+          city?: string;
+          district?: string;
+          county?: string;
+          state?: string;
+          countryName?: string;
+          postalCode?: string;
+        };
+        position?: {
+          lat?: number;
+          lng?: number;
+        };
+      }>;
     };
 
-    const addr = data.address || {};
+    const item = data.items?.[0];
+    if (!item) {
+      return {};
+    }
+
+    const addr = item.address || {};
     return {
-      address: data.display_name,
-      city: addr.city || addr.town || addr.village,
-      postcode: addr.postcode,
+      address: addr.label || item.title,
+      city: addr.city || addr.district || addr.county,
+      postcode: addr.postalCode,
       state: addr.state,
-      country: addr.country,
-      lat: data.lat ? Number(data.lat) : undefined,
-      lon: data.lon ? Number(data.lon) : undefined,
+      country: addr.countryName,
+      lat: item.position?.lat,
+      lon: item.position?.lng,
     };
   } catch (error) {
     logger.error("Reverse geocode error:", error);
@@ -83,12 +95,14 @@ const forwardGeocode = async (
   limit: number = 5,
 ): Promise<ForwardGeocodeResult[]> => {
   try {
-    const url = new URL(`${config.locationiq.base_url}/search`);
-    url.searchParams.append("key", config.locationiq.api_key);
+    const url = new URL(
+      config.here.geocode_base_url.endsWith("/geocode")
+        ? config.here.geocode_base_url
+        : `${config.here.geocode_base_url}/geocode`,
+    );
     url.searchParams.append("q", query);
-    url.searchParams.append("format", "json");
     url.searchParams.append("limit", String(limit));
-    // countrycodes removed — allow global search (Morocco-only was here before)
+    url.searchParams.append("apiKey", config.here.api_key);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -100,32 +114,37 @@ const forwardGeocode = async (
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      logger.warn(`LocationIQ forward geocode failed: ${response.status}`);
+      logger.warn(`HERE forward geocode failed: ${response.status}`);
       return [];
     }
 
-    const data = (await response.json()) as Array<{
-      display_name?: string;
-      lat?: string;
-      lon?: string;
-      address?: {
-        city?: string;
-        town?: string;
-        village?: string;
-        postcode?: string;
-        state?: string;
-        country?: string;
-      };
-    }>;
+    const data = (await response.json()) as {
+      items?: Array<{
+        title?: string;
+        address?: {
+          label?: string;
+          city?: string;
+          district?: string;
+          county?: string;
+          state?: string;
+          countryName?: string;
+          postalCode?: string;
+        };
+        position?: {
+          lat?: number;
+          lng?: number;
+        };
+      }>;
+    };
 
-    return data.map((item) => ({
-      displayName: item.display_name || "",
-      lat: item.lat ? Number(item.lat) : 0,
-      lon: item.lon ? Number(item.lon) : 0,
-      city: item.address?.city || item.address?.town || item.address?.village,
-      postcode: item.address?.postcode,
+    return (data.items || []).map((item) => ({
+      displayName: item.address?.label || item.title || "",
+      lat: item.position?.lat ?? 0,
+      lon: item.position?.lng ?? 0,
+      city: item.address?.city || item.address?.district || item.address?.county,
+      postcode: item.address?.postalCode,
       state: item.address?.state,
-      country: item.address?.country,
+      country: item.address?.countryName,
     }));
   } catch (error) {
     logger.error("Forward geocode error:", error);

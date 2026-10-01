@@ -120,6 +120,19 @@ export default {
     api_base_url: process.env.API_BASE_URL || "http://localhost:5000",
   },
 
+  here: {
+    api_key:
+      process.env.HERE_API_KEY ||
+      "wPgJE0NtKI89Jhi8-gGsJic7odTX9MBo3aA5qiFZw5A",
+    app_id: process.env.HERE_APP_ID || "hj55F4fwmbHWqQ02M9TH",
+    geocode_base_url:
+      process.env.HERE_GEOCODE_BASE_URL ||
+      "https://geocode.search.hereapi.com/v1",
+    revgeocode_base_url:
+      process.env.HERE_REVGEOCODE_BASE_URL ||
+      "https://revgeocode.search.hereapi.com/v1",
+  },
+
   locationiq: {
     api_key: process.env.LOCATIONIQ_API_KEY || "",
     base_url: process.env.LOCATIONIQ_BASE_URL || "https://us1.locationiq.com/v1",
