@@ -3,6 +3,7 @@ import { sendFCMNotification } from "./firebase";
 import { logger } from "logger/logger";
 import { NotificationRepository } from "module/notification/notification.repository";
 import { NotificationAudience } from "module/notification/notification.interface";
+import redisClient from "../redis/redisClient";
 
 /**
  * Fire-and-forget push to a user's registered FCM device token.
@@ -16,6 +17,17 @@ export const notifyUser = async (
   data?: Record<string, string>,
 ): Promise<void> => {
   try {
+    // Suppress identical notifications to the same user within 15s
+    const dedupKey = `notify:dedup:${userId}:${title}`;
+    const isNew = await redisClient.setNX(dedupKey, "1", 15);
+    if (!isNew) {
+      logger.info("[FCM] Duplicate notifyUser suppressed within 15s window", {
+        userId,
+        title,
+      });
+      return;
+    }
+
     logger.info("[FCM] notifyUser start", {
       userId,
       title,

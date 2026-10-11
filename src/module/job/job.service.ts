@@ -35,6 +35,10 @@ export const notifyNearbyHelpers = async (job: any) => {
   try {
     if (!job || !job.location || !job.location.coordinates) return;
     const [lon, lat] = job.location.coordinates;
+    const categoryId =
+      job.category && typeof job.category === "object" && "_id" in job.category
+        ? job.category._id
+        : job.category;
 
     const filter: any = {
       helperApplicationStatus: "approved",
@@ -48,28 +52,60 @@ export const notifyNearbyHelpers = async (job: any) => {
       },
     };
 
-    if (job.category) {
+    if (categoryId) {
       filter.$or = [
-        { serviceType: job.category },
+        { serviceType: categoryId },
         { serviceType: { $exists: false } },
         { serviceType: null },
       ];
     }
 
     const nearbyHelpers = await UserRepository.findMany(filter, { limit: 50 });
-    const jobData = job.toObject ? job.toObject() : job;
+
+    // Fetch fully populated and image-resolved job data so helpers get real details in real-time
+    const fullJob =
+      (job._id ? await JobRepository.findDetailsById(job._id) : null) ||
+      (job.toObject ? job.toObject() : job);
 
     const tokens: string[] = [];
     const title = "New Job Nearby";
     const body = `New job available: ${job.title} (${job.budget} MAD)`;
     const data = { jobId: String(job._id), type: "new_job" };
 
+    const R = 6378100; // earth radius meters
+    const toRad = (d: number) => (d * Math.PI) / 180;
+    const postedById = String(
+      fullJob.postedBy?._id || fullJob.postedBy || job.postedBy,
+    );
+
     for (const helper of nearbyHelpers) {
-      if (String(helper._id) === String(job.postedBy)) continue;
-      emitToUser(String(helper._id), "job:new_nearby", jobData);
+      const helperIdStr = String(helper._id);
+      if (helperIdStr === postedById) continue;
+
+      let distanceKm: number | undefined;
+      const hCoords = helper.location?.coordinates;
+      if (Array.isArray(hCoords) && hCoords.length >= 2) {
+        const [hLng, hLat] = hCoords;
+        const dLat = toRad(Number(lat) - Number(hLat));
+        const dLng = toRad(Number(lon) - Number(hLng));
+        const a =
+          Math.sin(dLat / 2) ** 2 +
+          Math.cos(toRad(Number(hLat))) *
+            Math.cos(toRad(Number(lat))) *
+            Math.sin(dLng / 2) ** 2;
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        distanceKm = Math.round(((R * c) / 1000) * 10) / 10;
+      }
+
+      const helperPayload = {
+        ...fullJob,
+        ...(distanceKm !== undefined ? { distanceKm } : {}),
+      };
+
+      emitToUser(helperIdStr, "job:new_nearby", helperPayload);
       // In-app history (works even without FCM token)
       NotificationRepository.create({
-        user: String(helper._id),
+        user: helperIdStr,
         audience: NotificationAudience.USER,
         title,
         body,
@@ -258,7 +294,7 @@ const getNearbyJobs = async (
 
 // ─── Get Job by ID ──────────────────────────────────────
 const getJobById = async (jobId: string) => {
-  const job = await JobRepository.findById(jobId);
+  const job = await JobRepository.findDetailsById(jobId);
   if (!job) {
     throw new AppError(StatusCodes.NOT_FOUND, "Job not found");
   }
@@ -277,7 +313,7 @@ const updateJob = async (
   }
 
   // Only owner can update
-  if (String(job.postedBy) !== String(userId)) {
+  if (String(job.postedBy?._id || job.postedBy) !== String(userId)) {
     throw new AppError(
       StatusCodes.FORBIDDEN,
       "You can only update your own jobs",
@@ -538,7 +574,13 @@ const completeJob = async (
     );
   }
 
-  if (job.status !== JobStatus.IN_PROGRESS) {
+  const completableStatuses = [
+    JobStatus.IN_PROGRESS,
+    JobStatus.ON_THE_WAY,
+    JobStatus.ARRIVED,
+  ];
+
+  if (!completableStatuses.includes(job.status)) {
     throw new AppError(
       StatusCodes.BAD_REQUEST,
       `Cannot complete a job with status ${job.status}`,
@@ -898,7 +940,7 @@ const deleteJob = async (userId: string, jobId: string) => {
   }
 
   // Only owner can delete
-  if (String(job.postedBy) !== String(userId)) {
+  if (String(job.postedBy?._id || job.postedBy) !== String(userId)) {
     throw new AppError(
       StatusCodes.FORBIDDEN,
       "You can only delete your own jobs",

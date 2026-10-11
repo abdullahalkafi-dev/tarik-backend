@@ -45,6 +45,7 @@ export interface TOfferData {
   images: string[];
   status: OfferStatus;
   acceptedJobId?: Types.ObjectId;
+  commissionDeducted?: number;
 }
 
 export interface TReadBy {

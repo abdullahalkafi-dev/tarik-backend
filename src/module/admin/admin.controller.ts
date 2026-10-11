@@ -262,6 +262,16 @@ const getJobCancellations = catchAsync(async (req, res) => {
   });
 });
 
+const getLiveHelperLocations = catchAsync(async (_req, res) => {
+  const result = await AdminService.getLiveHelperLocations();
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Live helper locations fetched successfully",
+    data: result,
+  });
+});
+
 export const AdminController = {
   listHelperApplications,
   getHelperById,
@@ -285,4 +295,5 @@ export const AdminController = {
   getUserBookings,
   getJobPipelineSummary,
   getJobCancellations,
+  getLiveHelperLocations,
 };

@@ -1,3 +1,4 @@
+import { Types } from "mongoose";
 import { StatusCodes } from "http-status-codes";
 import AppError from "errors/AppError";
 import { ChatRepository } from "./chat.repository";
@@ -13,6 +14,40 @@ import {
   PaymentMethod,
 } from "./chat.interface";
 import { JobStatus } from "module/job/job.interface";
+
+// ─── Commission & Budget Helpers ───────────────────────
+const getPlatformFeePercentage = async (): Promise<number> => {
+  let feePct = 20;
+  try {
+    const { SettingsService } = await import("../settings/settings.service");
+    const settings = await SettingsService.getSettings();
+    if (settings?.platformFeePercentage != null) {
+      feePct = settings.platformFeePercentage;
+    }
+  } catch (_) {}
+  return feePct;
+};
+
+const calculateOfferBudgetAndCommission = async (offerData: {
+  price: number;
+  priceType?: string;
+  startTime?: string;
+  endTime?: string;
+  paymentMethod?: string;
+}): Promise<{ totalBudget: number; commission: number }> => {
+  const isHourly = (offerData.priceType || "fixed") === "hourly";
+  const totalBudget = isHourly
+    ? calcHourlyTotalMAD(Number(offerData.price) || 0, offerData.startTime, offerData.endTime)
+    : Math.round(Number(offerData.price) || 0);
+
+  if (offerData.paymentMethod !== "cash" && offerData.paymentMethod !== PaymentMethod.CASH) {
+    return { totalBudget, commission: 0 };
+  }
+
+  const feePct = await getPlatformFeePercentage();
+  const commission = Math.round(totalBudget * (feePct / 100));
+  return { totalBudget, commission };
+};
 
 // ─── Helper: other participant id ──────────────────────
 const getOtherParticipantId = (conversation: any, userId: string): string | null => {
@@ -345,33 +380,85 @@ const sendOffer = async (
     );
   }
 
-  const message = await ChatRepository.createMessage({
-    conversation: conversationId as any,
-    sender: sid as any,
-    type: MessageType.OFFER,
-    offerData: {
-      title: payload.title,
-      description: payload.description || "",
-      price: payload.price,
-      priceType: (payload.priceType as PriceType) || PriceType.FIXED,
-      date: payload.date || "",
-      startTime: payload.startTime || "",
-      endTime: payload.endTime || "",
-      address: payload.address || "",
-      location:
-        payload.longitude != null && payload.latitude != null
-          ? {
-              type: "Point",
-              coordinates: [payload.longitude, payload.latitude],
-            }
-          : undefined,
-      paymentMethod:
-        (payload.paymentMethod as PaymentMethod) || PaymentMethod.CASH,
-      images: payload.images || [],
-      status: OfferStatus.PENDING,
-    },
-    readBy: [{ userId: sid as any, readAt: new Date() }],
+  const senderUser = await UserRepository.findById(sid);
+  if (!senderUser?.serviceType) {
+    throw new AppError(
+      StatusCodes.BAD_REQUEST,
+      "Helper must set a service type before sending offers. Update your profile first.",
+    );
+  }
+
+  const paymentMethod =
+    (payload.paymentMethod as PaymentMethod) || PaymentMethod.CASH;
+
+  const { commission } = await calculateOfferBudgetAndCommission({
+    price: payload.price,
+    priceType: payload.priceType,
+    startTime: payload.startTime,
+    endTime: payload.endTime,
+    paymentMethod,
   });
+
+  const offerMessageId = new Types.ObjectId();
+  const { WalletRepository } = await import("module/wallet/wallet.repository");
+
+  if (paymentMethod === PaymentMethod.CASH && commission > 0) {
+    try {
+      await WalletRepository.deductCommission(
+        sid,
+        commission,
+        `offer_${offerMessageId}`,
+      );
+    } catch (err: any) {
+      throw new AppError(
+        StatusCodes.BAD_REQUEST,
+        err.message || `Insufficient wallet balance to send offer. Required commission: ${commission} MAD.`,
+      );
+    }
+  }
+
+  let message: any;
+  try {
+    message = await ChatRepository.createMessage({
+      _id: offerMessageId,
+      conversation: conversationId as any,
+      sender: sid as any,
+      type: MessageType.OFFER,
+      offerData: {
+        title: payload.title,
+        description: payload.description || "",
+        price: payload.price,
+        priceType: (payload.priceType as PriceType) || PriceType.FIXED,
+        date: payload.date || "",
+        startTime: payload.startTime || "",
+        endTime: payload.endTime || "",
+        address: payload.address || "",
+        location:
+          payload.longitude != null && payload.latitude != null
+            ? {
+                type: "Point",
+                coordinates: [payload.longitude, payload.latitude],
+              }
+            : undefined,
+        paymentMethod,
+        images: payload.images || [],
+        status: OfferStatus.PENDING,
+        commissionDeducted: commission,
+      },
+      readBy: [{ userId: sid as any, readAt: new Date() }],
+    });
+  } catch (err) {
+    if (paymentMethod === PaymentMethod.CASH && commission > 0) {
+      try {
+        await WalletRepository.refundCommission(
+          sid,
+          commission,
+          `offer_${offerMessageId}`,
+        );
+      } catch (_) {}
+    }
+    throw err;
+  }
 
   await ChatRepository.updateConversationLastMessage(
     conversationId,
@@ -594,7 +681,8 @@ const acceptOffer = async (
 
   let job: any;
   try {
-    job = await createJobFromOffer(offer, String(message.sender), uid, offerMessageId);
+    const offerToUse = (claimed as any)?.offerData || offer;
+    job = await createJobFromOffer(offerToUse, String(message.sender), uid, offerMessageId);
   } catch (err) {
     // Rollback claim so offer is not stuck ACCEPTED without a job
     await ChatRepository.updateOfferStatus(
@@ -699,6 +787,21 @@ const rejectOffer = async (
 
   await emitOfferUpdated(conversationId, uid, rejected);
 
+  // Refund helper's commission if it was deducted upfront
+  const rejectCommissionToRefund = Number(message.offerData?.commissionDeducted) || 0;
+  if (rejectCommissionToRefund > 0) {
+    try {
+      const { WalletRepository } = await import("module/wallet/wallet.repository");
+      await WalletRepository.refundCommission(
+        String(message.sender),
+        rejectCommissionToRefund,
+        `offer_${offerMessageId}`,
+      );
+    } catch (err: any) {
+      console.error("[CHAT] Failed to refund commission on rejectOffer:", err?.message);
+    }
+  }
+
   notifyUser(
     String(message.sender),
     "Offer rejected",
@@ -781,6 +884,21 @@ const cancelOffer = async (
     );
   }
 
+  // Refund helper's commission if it was deducted upfront
+  const cancelCommissionToRefund = Number(message.offerData?.commissionDeducted) || 0;
+  if (cancelCommissionToRefund > 0) {
+    try {
+      const { WalletRepository } = await import("module/wallet/wallet.repository");
+      await WalletRepository.refundCommission(
+        String(message.sender),
+        cancelCommissionToRefund,
+        `offer_${offerMessageId}`,
+      );
+    } catch (err: any) {
+      console.error("[CHAT] Failed to refund commission on cancelOffer:", err?.message);
+    }
+  }
+
   await emitOfferUpdated(conversationId, uid, cancelled);
 
   // Notify the other participant (the client who would have accepted)
@@ -855,7 +973,55 @@ const editOffer = async (
     );
   }
 
+  const oldOffer = message.offerData;
+  const oldCommission = Number(oldOffer.commissionDeducted) || 0;
+
+  const effectivePrice = payload.price != null ? payload.price : oldOffer.price;
+  const effectivePriceType = payload.priceType != null ? payload.priceType : oldOffer.priceType;
+  const effectiveStartTime = payload.startTime != null ? payload.startTime : oldOffer.startTime;
+  const effectiveEndTime = payload.endTime != null ? payload.endTime : oldOffer.endTime;
+  const effectivePaymentMethod = (payload.paymentMethod != null ? payload.paymentMethod : oldOffer.paymentMethod) as PaymentMethod;
+
+  const { commission: newCommission } = await calculateOfferBudgetAndCommission({
+    price: effectivePrice,
+    priceType: effectivePriceType,
+    startTime: effectiveStartTime,
+    endTime: effectiveEndTime,
+    paymentMethod: effectivePaymentMethod,
+  });
+
+  const { WalletRepository } = await import("module/wallet/wallet.repository");
+  const commissionDiff = newCommission - oldCommission;
+
+  if (commissionDiff > 0) {
+    // Price or hours increased / switched to cash: deduct additional commission
+    try {
+      await WalletRepository.deductCommission(
+        uid,
+        commissionDiff,
+        `offer_${offerMessageId}`,
+      );
+    } catch (err: any) {
+      throw new AppError(
+        StatusCodes.BAD_REQUEST,
+        err.message || `Insufficient wallet balance. Additional ${commissionDiff} MAD commission required for this price update.`,
+      );
+    }
+  } else if (commissionDiff < 0) {
+    // Price or hours decreased / switched to online: refund difference back to helper
+    try {
+      await WalletRepository.refundCommission(
+        uid,
+        Math.abs(commissionDiff),
+        `offer_${offerMessageId}`,
+      );
+    } catch (err: any) {
+      console.error("[CHAT] Failed to refund commission difference on editOffer:", err?.message);
+    }
+  }
+
   const update: any = { ...payload };
+  update.commissionDeducted = newCommission;
   if (payload.longitude != null && payload.latitude != null) {
     update.location = {
       type: "Point",
@@ -865,7 +1031,33 @@ const editOffer = async (
   delete update.longitude;
   delete update.latitude;
 
-  const updated = await ChatRepository.updateOfferData(offerMessageId, update);
+  let updated: any;
+  try {
+    updated = await ChatRepository.updateOfferData(offerMessageId, update);
+    if (!updated) {
+      throw new AppError(
+        StatusCodes.BAD_REQUEST,
+        "This offer is no longer pending",
+      );
+    }
+  } catch (err) {
+    // Rollback commission adjustment if DB update failed
+    if (commissionDiff > 0) {
+      await WalletRepository.refundCommission(
+        uid,
+        commissionDiff,
+        `offer_${offerMessageId}`,
+      ).catch(() => {});
+    } else if (commissionDiff < 0) {
+      await WalletRepository.deductCommission(
+        uid,
+        Math.abs(commissionDiff),
+        `offer_${offerMessageId}`,
+      ).catch(() => {});
+    }
+    throw err;
+  }
+
   if (updated) {
     await emitOfferUpdated(conversationId, uid, updated);
     const otherId = getOtherParticipantId(conversation, uid);
@@ -953,20 +1145,28 @@ const createJobFromOffer = async (
   } catch (_) {}
 
   let commission = 0;
-  if (offer.paymentMethod === "cash") {
-    commission = Math.round(totalBudget * (feePct / 100));
-    const { WalletRepository } = await import("module/wallet/wallet.repository");
-    try {
-      await WalletRepository.deductCommission(
-        helperId,
-        commission,
-        offerMessageId ? `offer_${offerMessageId}` : `offer_${Date.now()}`,
-      );
-    } catch (err: any) {
-      throw new AppError(
-        StatusCodes.BAD_REQUEST,
-        err.message || `Failed to deduct ${feePct}% platform commission. Insufficient wallet balance.`
-      );
+  if (offer.paymentMethod === "cash" || offer.paymentMethod === PaymentMethod.CASH) {
+    if (offer.commissionDeducted != null) {
+      // Commission was already deducted upfront when helper sent or edited the offer
+      commission = Number(offer.commissionDeducted) || 0;
+    } else {
+      // Fallback for legacy offers created before upfront deduction
+      commission = Math.round(totalBudget * (feePct / 100));
+      if (commission > 0) {
+        const { WalletRepository } = await import("module/wallet/wallet.repository");
+        try {
+          await WalletRepository.deductCommission(
+            helperId,
+            commission,
+            offerMessageId ? `offer_${offerMessageId}` : `offer_${Date.now()}`,
+          );
+        } catch (err: any) {
+          throw new AppError(
+            StatusCodes.BAD_REQUEST,
+            err.message || `Failed to deduct ${feePct}% platform commission. Insufficient wallet balance.`
+          );
+        }
+      }
     }
   }
 
@@ -1026,8 +1226,8 @@ const createJobFromOffer = async (
   try {
     job = await JobRepository.create(jobData);
   } catch (err) {
-    // Compensate: return commission if job row could not be created
-    if (commission > 0) {
+    // Compensate: return commission only if deducted right here (legacy fallback)
+    if (offer.commissionDeducted == null && commission > 0) {
       try {
         const { WalletRepository } = await import("module/wallet/wallet.repository");
         await WalletRepository.refundCommission(

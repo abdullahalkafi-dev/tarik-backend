@@ -632,6 +632,54 @@ const getUserBookings = async (userId: string, page: number = 1, limit: number =
   return JobRepository.findAll(filter, { page, limit });
 };
 
+// ─── Live Helper Locations (Fleet Map) ──────────────────────
+const getLiveHelperLocations = async () => {
+  const { SocketTrackingService } = await import("../../socket/socket.tracking");
+  const liveHelpers = await SocketTrackingService.getAllLiveHelpers();
+  const liveMap = new Map<string, any>();
+  for (const item of liveHelpers) {
+    liveMap.set(item.helperId, item);
+  }
+
+  const filter = {
+    isHelperFormSubmitted: true,
+    helperApplicationStatus: HelperApplicationStatus.APPROVED,
+    isBlocked: false,
+    isDeleted: false,
+  };
+
+  const helpers = await UserRepository.findMany(filter, {
+    select: "name phone avatar location serviceType rating reviewCount city updatedAt",
+    populate: "serviceType",
+    limit: 300,
+  });
+
+  return helpers
+    .map((h: any) => {
+      const id = String(h._id);
+      const live = liveMap.get(id);
+      const coords = live
+        ? [live.longitude, live.latitude]
+        : h.location?.coordinates || null;
+
+      return {
+        id,
+        name: h.name,
+        phone: h.phone,
+        avatar: resolveUrl(h.avatar),
+        serviceType: h.serviceType?.name || h.serviceType?.title || "Helper",
+        city: h.city,
+        rating: h.rating || 0,
+        reviewCount: h.reviewCount || 0,
+        coordinates: coords,
+        isLive: !!live,
+        activeJobId: live?.jobId || null,
+        lastSeenAt: live ? new Date(live.updatedAt) : h.updatedAt,
+      };
+    })
+    .filter((h) => h.coordinates && h.coordinates.length === 2);
+};
+
 export const AdminService = {
   listHelperApplications,
   getHelperById,
@@ -653,4 +701,5 @@ export const AdminService = {
   // Job/Booking History
   getHelperJobs,
   getUserBookings,
+  getLiveHelperLocations,
 };

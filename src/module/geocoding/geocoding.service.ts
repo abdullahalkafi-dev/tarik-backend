@@ -60,6 +60,7 @@ const reverseGeocode = async (
           county?: string;
           state?: string;
           countryName?: string;
+          countryCode?: string;
           postalCode?: string;
         };
         position?: {
@@ -75,8 +76,15 @@ const reverseGeocode = async (
     }
 
     const addr = item.address || {};
+    const countryCode = addr.countryCode?.toUpperCase();
+    const allowed = (config.geo?.allowed_countries || "")
+      .toUpperCase()
+      .split(",")
+      .map((c: string) => c.trim());
+    const isSupported = !countryCode || allowed.includes(countryCode);
+
     return {
-      address: addr.label || item.title,
+      address: isSupported ? (addr.label || item.title) : "Location outside supported region",
       city: addr.city || addr.district || addr.county,
       postcode: addr.postalCode,
       state: addr.state,
@@ -103,6 +111,9 @@ const forwardGeocode = async (
     url.searchParams.append("q", query);
     url.searchParams.append("limit", String(limit));
     url.searchParams.append("apiKey", config.here.api_key);
+    if (config.geo.allowed_countries) {
+      url.searchParams.append("in", `countryCode:${config.geo.allowed_countries}`);
+    }
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);

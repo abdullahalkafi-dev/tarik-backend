@@ -54,6 +54,18 @@ router.get(
   AdminController.getJobCancellations,
 );
 
+// ─── Live Fleet Map ──────────────────────────────────────────────────────────
+/**
+ * @route   GET /api/v1/admin/map/helpers
+ * @desc    Get live & last known helper locations for admin fleet map
+ * @access  Private (superAdmin, admin, staff)
+ */
+router.get(
+  "/map/helpers",
+  auth("superAdmin", "admin", "staff"),
+  AdminController.getLiveHelperLocations,
+);
+
 // ─── Helper Applications ─────────────────────────────────────────────────────
 /**
  * @route   GET /api/v1/admin/helpers

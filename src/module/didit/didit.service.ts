@@ -12,6 +12,7 @@ import { HelperApplicationStatus } from "../user/user.interface";
 import { AuthRole } from "../auth/auth.interface";
 import { disconnectUserSockets } from "../../socket/socket.gateway";
 import { notifyUser } from "../../util/notifyUser";
+import { logger } from "../../logger/logger";
 
 const DIDIT_BASE_URL = "https://verification.didit.me/v3";
 const MAX_SESSIONS_PER_DAY = 5;
@@ -285,6 +286,17 @@ const processDecisionInternal = async (
     (statusString.toLowerCase() === "approved" && (isBiometricMatch || livenessPassed));
 
   if (isApproved) {
+    // Idempotency: If helper is already approved, skip duplicate notification and updates
+    if (
+      user.helperApplicationStatus === HelperApplicationStatus.APPROVED &&
+      user.diditStatus === "Approved"
+    ) {
+      logger.info(
+        `[Didit] User ${userId} is already approved. Suppressing duplicate KYC notification & re-promotion.`,
+      );
+      return { status: "approved", autoBanned: false };
+    }
+
     // Auto-Approve Helper
     await UserRepository.updateById(userId, {
       helperApplicationStatus: HelperApplicationStatus.APPROVED,
@@ -315,6 +327,17 @@ const processDecisionInternal = async (
       { type: "kyc_approved", status: "approved" },
     ).catch(() => {});
   } else if (statusString === "In Review") {
+    // Idempotency: If helper is already marked In Review, skip duplicate notification
+    if (
+      user.helperApplicationStatus === HelperApplicationStatus.PENDING &&
+      user.diditStatus === "In Review"
+    ) {
+      logger.info(
+        `[Didit] User ${userId} is already marked In Review. Suppressing duplicate notification.`,
+      );
+      return { status: "in_review", autoBanned: false };
+    }
+
     await UserRepository.updateById(userId, {
       helperApplicationStatus: HelperApplicationStatus.PENDING,
       diditStatus: "In Review",
@@ -342,6 +365,17 @@ const processDecisionInternal = async (
       decision?.decline_reason ||
       decision?.reason ||
       (!isBiometricMatch ? "Face match score below threshold" : "Liveness or document scan failed");
+
+    // Idempotency: If helper is already rejected with matching status, skip duplicate notification
+    if (
+      user.helperApplicationStatus === HelperApplicationStatus.REJECTED &&
+      user.diditStatus === (statusString || "Declined")
+    ) {
+      logger.info(
+        `[Didit] User ${userId} is already declined. Suppressing duplicate notification.`,
+      );
+      return { status: "rejected", autoBanned: false };
+    }
 
     await UserRepository.updateById(userId, {
       helperApplicationStatus: HelperApplicationStatus.REJECTED,
@@ -430,6 +464,21 @@ const handleWebhook = async (
  * Mobile instant sync API calling Didit decision endpoint directly.
  */
 const syncSession = async (userId: string, sessionId: string) => {
+  // Prevent concurrent duplicate sync calls across callback, deep link, and app resume
+  const syncLockKey = `didit:sync_lock:${sessionId}`;
+  const lockAcquired = await redisClient.setNX(syncLockKey, "1", 10);
+  if (!lockAcquired) {
+    logger.info(`[Didit] Concurrent syncSession suppressed for session ${sessionId}`);
+    const user = await UserRepository.findById(userId);
+    return {
+      status:
+        user?.helperApplicationStatus === HelperApplicationStatus.APPROVED
+          ? "approved"
+          : (user?.diditStatus?.toLowerCase() || "in_progress"),
+      autoBanned: false,
+    };
+  }
+
   try {
     const response = await fetch(`${DIDIT_BASE_URL}/session/${sessionId}/decision/`, {
       method: "GET",

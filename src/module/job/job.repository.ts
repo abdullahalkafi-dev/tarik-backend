@@ -18,6 +18,9 @@ const resolveJobImages = (job: any) => {
     category: obj.category && typeof obj.category === "object" && "name" in obj.category
       ? { ...obj.category, icon: resolveUrl(obj.category.icon) }
       : obj.category,
+    cancelledBy: obj.cancelledBy && typeof obj.cancelledBy === "object" && "name" in obj.cancelledBy
+      ? { ...obj.cancelledBy, avatar: resolveUrl(obj.cancelledBy.avatar) }
+      : obj.cancelledBy,
   };
 };
 
@@ -38,6 +41,17 @@ const findById = async (
     }
   }
   return query.exec();
+};
+
+const findDetailsById = async (id: string | Types.ObjectId) => {
+  const doc = await Job.findById(id)
+    .populate("postedBy", "name phone email avatar address city rating reviewCount")
+    .populate("assignedTo", "name phone email avatar address city rating reviewCount pricePerHour experience bio")
+    .populate("category", "name icon")
+    .populate("cancelledBy", "name avatar")
+    .exec();
+  if (!doc) return null;
+  return resolveJobImages(doc);
 };
 
 const findAll = async (
@@ -105,7 +119,7 @@ const transitionInProgressToCompleted = async (
   jobId: string | Types.ObjectId,
 ) => {
   return Job.findOneAndUpdate(
-    { _id: jobId, status: "in_progress" } as any,
+    { _id: jobId, status: { $in: ["in_progress", "on_the_way", "arrived"] } } as any,
     {
       $set: {
         status: "completed",
@@ -374,7 +388,6 @@ const findNearby = async (
           obj.address = `${parts[0]}, ${parts[1]}`;
         }
       }
-      delete obj.location;
     }
     return obj;
   });
@@ -426,8 +439,6 @@ const findMany = async (
         obj.address = obj.addressPublic;
       }
     }
-    // Strip GeoJSON from list payloads so clients cannot render lat/lng.
-    delete obj.location;
     return obj;
   });
 };
@@ -435,6 +446,7 @@ const findMany = async (
 export const JobRepository = {
   create,
   findById,
+  findDetailsById,
   findAll,
   findMany,
   updateById,

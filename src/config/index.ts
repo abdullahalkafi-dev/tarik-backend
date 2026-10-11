@@ -143,4 +143,10 @@ export default {
     workflow_id: process.env.DIDIT_WORKFLOW_ID || "",
     webhook_secret: process.env.DIDIT_WEBHOOK_SECRET || "",
   },
+
+  geo: {
+    allowed_countries:
+      process.env.ALLOWED_COUNTRIES ||
+      (process.env.NODE_ENV === "production" ? "MAR" : "MAR,BGD"),
+  },
 };

@@ -167,7 +167,11 @@ export const WalletRepository = {
   async deductCommission(userId: string, amount: number, jobId: string): Promise<TWallet> {
     await this.getOrCreateWallet(userId);
 
-    const description = `Platform commission for Job #${jobId}`;
+    const isOffer = jobId.startsWith("offer_");
+    const cleanId = isOffer ? jobId.replace("offer_", "") : jobId;
+    const description = isOffer
+      ? `Platform commission for offer #${cleanId}`
+      : `Platform commission for Job #${jobId}`;
     const entry = {
       amount: -amount,
       type: TransactionType.COMMISSION_DEDUCTION,
@@ -205,7 +209,7 @@ export const WalletRepository = {
       notifyUser(
         userId,
         "Commission deducted",
-        `${amount} MAD commission was deducted for job ${jobId}.`,
+        `${amount} MAD commission was deducted for ${isOffer ? "offer" : "job"} ${cleanId}.`,
         { type: "payment_success", orderType: "commission", jobId },
       ).catch(() => {});
     } catch (_) {}
@@ -216,7 +220,11 @@ export const WalletRepository = {
   async refundCommission(userId: string, amount: number, jobId: string): Promise<TWallet> {
     await this.getOrCreateWallet(userId);
 
-    const description = `Refund commission for cancelled Job #${jobId}`;
+    const isOffer = jobId.startsWith("offer_");
+    const cleanId = isOffer ? jobId.replace("offer_", "") : jobId;
+    const description = isOffer
+      ? `Refund commission for offer #${cleanId}`
+      : `Refund commission for cancelled Job #${jobId}`;
     const entry = {
       amount,
       type: TransactionType.COMMISSION_REFUND,
@@ -251,7 +259,7 @@ export const WalletRepository = {
       notifyUser(
         userId,
         "Commission refunded",
-        `${amount} MAD was refunded to your wallet for cancelled job ${jobId}.`,
+        `${amount} MAD was refunded to your wallet for ${isOffer ? "offer" : "cancelled job"} ${cleanId}.`,
         { type: "payment_success", orderType: "commission_refund", jobId },
       ).catch(() => {});
     } catch (_) {}

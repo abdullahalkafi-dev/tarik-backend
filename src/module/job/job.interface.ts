@@ -3,6 +3,8 @@ import { Types } from "mongoose";
 export enum JobStatus {
   PENDING_PAYMENT = "pending_payment",
   OPEN = "open",
+  ON_THE_WAY = "on_the_way",
+  ARRIVED = "arrived",
   IN_PROGRESS = "in_progress",
   COMPLETED = "completed",
   CANCELLED = "cancelled",

@@ -1,7 +1,7 @@
 import { Types } from "mongoose";
 import { Conversation } from "./conversation.model";
 import { Message } from "./message.model";
-import { TConversation, TMessage } from "./chat.interface";
+import { TConversation, TMessage, OfferStatus } from "./chat.interface";
 import { resolveUrl } from "../../util/minio";
 
 // ─── Conversation Repository ───────────────────────────
@@ -246,8 +246,14 @@ const updateOfferData = async (
   if (offerData.location !== undefined) setFields["offerData.location"] = offerData.location;
   if (offerData.paymentMethod !== undefined) setFields["offerData.paymentMethod"] = offerData.paymentMethod;
   if (offerData.images !== undefined) setFields["offerData.images"] = offerData.images;
+  if (offerData.commissionDeducted !== undefined) setFields["offerData.commissionDeducted"] = offerData.commissionDeducted;
 
-  return Message.findByIdAndUpdate(messageId, { $set: setFields }, { new: true });
+  const filter: any = {
+    _id: messageId,
+    type: "offer",
+    "offerData.status": OfferStatus.PENDING,
+  };
+  return Message.findOneAndUpdate(filter, { $set: setFields }, { new: true });
 };
 
 /** Reset online offers stuck in AWAITING_PAYMENT longer than hours back to PENDING. */

@@ -10,6 +10,7 @@ import { socketAuthMiddleware } from "./socket.auth";
 import { SocketPresenceService } from "./socket.presence";
 import { ChatService } from "../module/chat/chat.service";
 import { Conversation } from "../module/chat/conversation.model";
+import { SocketTrackingService, getTrackingRoom } from "./socket.tracking";
 
 let ioInstance: Server | null = null;
 let pubClient: RedisClientType | null = null;
@@ -214,10 +215,66 @@ export const initializeSocketServer = async (server: http.Server) => {
       socket.leave(`support:${ticketId}`);
     });
 
+    // ─── Tracking Events ─────────────────────────────────
+    socket.on(
+      "helper:location_ping",
+      async (data: {
+        latitude: number;
+        longitude: number;
+        heading?: number;
+        speed?: number;
+        jobId?: string;
+      }) => {
+        if (!data || typeof data.latitude !== "number" || typeof data.longitude !== "number") {
+          return;
+        }
+        await SocketTrackingService.recordHelperLocation(userId, data);
+      },
+    );
+
+    socket.on("tracking:join", async ({ jobId }: { jobId: string }) => {
+      try {
+        if (!jobId) return;
+        const { Job } = await import("../module/job/job.model");
+        const job = await Job.findById(jobId).select("postedBy assignedTo");
+        if (!job) return;
+
+        const isAdmin =
+          socket.data.role === "admin" ||
+          socket.data.role === "superAdmin" ||
+          socket.data.role === "staff";
+        const isParticipant =
+          String(job.postedBy) === userId || String(job.assignedTo) === userId;
+
+        if (isAdmin || isParticipant) {
+          socket.join(getTrackingRoom(jobId));
+          // If a helper is assigned, immediately send their cached coordinates
+          if (job.assignedTo) {
+            const latest = await SocketTrackingService.getHelperLatestLocation(
+              String(job.assignedTo),
+            );
+            if (latest) {
+              socket.emit("tracking:location_update", {
+                ...latest,
+                jobId,
+              });
+            }
+          }
+        }
+      } catch (_) {}
+    });
+
+    socket.on("tracking:leave", ({ jobId }: { jobId: string }) => {
+      if (jobId) {
+        socket.leave(getTrackingRoom(jobId));
+      }
+    });
+
     socket.on("disconnect", async () => {
       const nextState = await SocketPresenceService.removeConnection(socket.id);
       if (nextState.userId && nextState.becameOffline) {
         emitPresenceUpdate(nextState.userId, false);
+        await SocketTrackingService.removeHelper(nextState.userId);
       }
     });
   });

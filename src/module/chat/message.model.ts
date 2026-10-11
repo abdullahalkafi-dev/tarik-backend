@@ -46,6 +46,10 @@ const offerDataSchema = new Schema(
       ref: "Job",
       default: null,
     },
+    commissionDeducted: {
+      type: Number,
+      default: 0,
+    },
   },
   { _id: false },
 );

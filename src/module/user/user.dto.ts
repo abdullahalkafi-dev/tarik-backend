@@ -1,4 +1,20 @@
 import z from "zod";
+import config from "../../config";
+
+export const isCoordinateInAllowedRegion = (lat: number, lon: number): boolean => {
+  // Morocco bounding box: Lat ~21.0 to 36.0, Lon ~ -17.5 to -1.0
+  const isMorocco = lat >= 21.0 && lat <= 36.0 && lon >= -17.5 && lon <= -1.0;
+  if (isMorocco) return true;
+
+  const allowed = (config.geo?.allowed_countries || "").toUpperCase();
+  if (allowed.includes("BGD") || allowed.includes("BD")) {
+    // Bangladesh bounding box: Lat ~20.5 to 26.7, Lon ~ 88.0 to 92.7
+    const isBangladesh = lat >= 20.5 && lat <= 26.7 && lon >= 88.0 && lon <= 92.7;
+    if (isBangladesh) return true;
+  }
+
+  return false;
+};
 
 const updateProfileDto = z.object({
   body: z
@@ -34,7 +50,11 @@ const updateLocationDto = z.object({
       latitude: z.number().min(-90).max(90),
       address: z.string().trim().max(500).optional(),
     })
-    .strict(),
+    .strict()
+    .refine((data) => isCoordinateInAllowedRegion(data.latitude, data.longitude), {
+      message: "Coordinates outside supported regions (Morocco / Bangladesh in dev)",
+      path: ["latitude"],
+    }),
 });
 
 const helperApplyDto = z.object({
