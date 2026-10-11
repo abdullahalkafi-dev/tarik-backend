@@ -95,13 +95,19 @@ export const resolveUrl = (value: string | null | undefined): string | null => {
     return `${baseUrl}/api/v1/upload/files/${key}`;
   }
 
-  // If already a full URL, replace any localhost/127.0.0.1 with the configured API host
+  // If already a full URL, replace any localhost/127.0.0.1/192.168.* with the configured API host
   if (value.startsWith("http://") || value.startsWith("https://")) {
     try {
       const parsed = new URL(value);
-      if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") {
+      if (
+        parsed.hostname === "localhost" ||
+        parsed.hostname === "127.0.0.1" ||
+        parsed.hostname.startsWith("192.168.")
+      ) {
         const baseParsed = new URL(baseUrl);
+        parsed.protocol = baseParsed.protocol;
         parsed.hostname = baseParsed.hostname;
+        parsed.port = baseParsed.port;
         return parsed.toString();
       }
     } catch (_) {
