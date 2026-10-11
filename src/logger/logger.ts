@@ -48,9 +48,7 @@ const logger = createLogger({
       zippedArchive: true,
       level: "info",
     }),
-    ...(IS_PRODUCTION
-      ? []
-      : [new transports.Console({ format: combine(colorize(), logFormat) })]),
+    new transports.Console({ format: combine(colorize(), logFormat) }),
   ],
   exceptionHandlers: [
     new DailyRotateFile({
@@ -83,9 +81,7 @@ const errorLogger = createLogger({
       maxFiles: "14d",
       zippedArchive: true,
     }),
-    ...(IS_PRODUCTION
-      ? []
-      : [new transports.Console({ format: combine(colorize(), logFormat) })]),
+    new transports.Console({ format: combine(colorize(), logFormat) }),
   ],
 });
 
