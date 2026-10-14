@@ -145,6 +145,6 @@ export default {
   },
 
   geo: {
-    allowed_countries: process.env.ALLOWED_COUNTRIES || "MAR,BGD",
+    allowed_countries: process.env.ALLOWED_COUNTRIES || "MAR,BGD,GBR,GB",
   },
 };

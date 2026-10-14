@@ -33,6 +33,8 @@ coverage/
 
 # Local utility scripts
 clean_tarik_db.js
+src/db/inspectAndSeed.ts
+src/db/seedRunner.ts
 
 # Local documentation & tracking files
 backend-update-track.md

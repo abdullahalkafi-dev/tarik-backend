@@ -13,6 +13,12 @@ export const isCoordinateInAllowedRegion = (lat: number, lon: number): boolean =
     if (isBangladesh) return true;
   }
 
+  if (allowed.includes("GBR") || allowed.includes("GB") || allowed.includes("UK")) {
+    // United Kingdom bounding box: Lat ~49.8 to 60.9, Lon ~ -8.6 to 1.8
+    const isUK = lat >= 49.8 && lat <= 60.9 && lon >= -8.6 && lon <= 1.8;
+    if (isUK) return true;
+  }
+
   return false;
 };
 
@@ -52,7 +58,7 @@ const updateLocationDto = z.object({
     })
     .strict()
     .refine((data) => isCoordinateInAllowedRegion(data.latitude, data.longitude), {
-      message: "Coordinates outside supported regions (Morocco / Bangladesh in dev)",
+      message: "Coordinates outside supported regions (Morocco / Bangladesh / United Kingdom)",
       path: ["latitude"],
     }),
 });

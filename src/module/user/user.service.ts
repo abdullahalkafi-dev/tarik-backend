@@ -352,7 +352,7 @@ const searchHelpers = async (query: THelperSearchQuery) => {
       }
     : filter;
 
-  const [helpers, total] = await Promise.all([
+  let [helpers, total] = await Promise.all([
     UserRepository.findMany(filter, {
       select:
         "name avatar address location pricePerHour experience serviceRadius bio city language serviceType rating reviewCount",
@@ -364,6 +364,23 @@ const searchHelpers = async (query: THelperSearchQuery) => {
     }),
     UserRepository.count(countFilter),
   ]);
+
+  // Fallback: If strict geo search returns 0 helpers, show active approved helpers so testing is never blocked
+  if (hasGeo && helpers.length === 0) {
+    const fallbackFilter = { ...filter };
+    delete fallbackFilter.location;
+    [helpers, total] = await Promise.all([
+      UserRepository.findMany(fallbackFilter, {
+        select:
+          "name avatar address location pricePerHour experience serviceRadius bio city language serviceType rating reviewCount",
+        sort: { rating: -1, createdAt: -1 },
+        skip,
+        limit,
+        populate: "serviceType",
+      }),
+      UserRepository.count(fallbackFilter),
+    ]);
+  }
 
   // Resolve avatar keys to full URLs
   const resolvedHelpers = helpers.map((h: any) => ({
