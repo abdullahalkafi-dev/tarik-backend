@@ -25,8 +25,12 @@ async function main() {
     await syncUserIndexes();
     await syncAuthIndexes();
 
-    // 3. Seed admin
-    await runSeed();
+    // 3. Seed admin/test data — never let a seed failure take the API down
+    try {
+      await runSeed();
+    } catch (error) {
+      errorLogger.error("Seed failed, continuing startup", error);
+    }
 
     // 3. Connect Redis
     try {

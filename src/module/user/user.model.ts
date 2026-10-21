@@ -106,7 +106,13 @@ const userSchema = new Schema<TUser>(
 
 // 2dsphere index for geo queries
 userSchema.index({ location: "2dsphere" });
-userSchema.index({ name: "text" });
+// MongoDB treats a document field named `language` as the text-index language
+// override; helpers store free text there ("Arabic, French"), which Mongo
+// rejects. Point the override at an unused field and don't stem names.
+userSchema.index(
+  { name: "text" },
+  { language_override: "textSearchLanguage", default_language: "none" },
+);
 
 export const User = model<TUser>("User", userSchema);
 
