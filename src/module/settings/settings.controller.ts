@@ -25,6 +25,11 @@ const updateSettings = catchAsync(async (req, res) => {
   });
 });
 
+// The seeded defaults ("… update from Admin → Settings → Legal.") are hints
+// for admins; never show them to app users — the app has its own fallback.
+const publicLegalText = (value?: string) =>
+  !value || /update from Admin/i.test(value) ? "" : value;
+
 const getPublicLegal = catchAsync(async (_req, res) => {
   const settings = await SettingsService.getSettings();
   sendResponse(res, {
@@ -32,8 +37,8 @@ const getPublicLegal = catchAsync(async (_req, res) => {
     success: true,
     message: "Legal pages fetched",
     data: {
-      termsOfService: settings.legal?.termsOfService || "",
-      privacyPolicy: settings.legal?.privacyPolicy || "",
+      termsOfService: publicLegalText(settings.legal?.termsOfService),
+      privacyPolicy: publicLegalText(settings.legal?.privacyPolicy),
     },
   });
 });

@@ -1,4 +1,5 @@
 import { StatusCodes } from "http-status-codes";
+import { Types } from "mongoose";
 import AppError from "errors/AppError";
 import { CategoryRepository } from "./category.repository";
 import cacheService from "redis/cacheService";
@@ -8,7 +9,13 @@ import { resolveUrl } from "util/minio";
 const CACHE_KEY = buildCacheKey("categories", "all");
 const CACHE_TTL = 3600; // 1 hour
 
-const create = async (payload: { name: string; icon?: string }) => {
+type TCategoryPricing = {
+  minHourlyRate?: number | null;
+  suggestedPriceMin?: number | null;
+  suggestedPriceMax?: number | null;
+};
+
+const create = async (payload: { name: string; icon?: string } & TCategoryPricing) => {
   const exists = await CategoryRepository.exists({ name: payload.name });
   if (exists) {
     throw new AppError(StatusCodes.CONFLICT, "Category name already exists");
@@ -55,7 +62,10 @@ const getById = async (id: string) => {
   return formatCategory(category);
 };
 
-const update = async (id: string, payload: { name?: string; icon?: string; isActive?: boolean }) => {
+const update = async (
+  id: string,
+  payload: { name?: string; icon?: string; isActive?: boolean } & TCategoryPricing,
+) => {
   if (payload.name) {
     const exists = await CategoryRepository.findOne({
       name: payload.name,
@@ -63,6 +73,19 @@ const update = async (id: string, payload: { name?: string; icon?: string; isAct
     });
     if (exists) {
       throw new AppError(StatusCodes.CONFLICT, "Category name already exists");
+    }
+  }
+
+  if (payload.suggestedPriceMin !== undefined || payload.suggestedPriceMax !== undefined) {
+    // Check the merged range when only one end is being changed.
+    const current = await CategoryRepository.findById(id);
+    const min = payload.suggestedPriceMin !== undefined ? payload.suggestedPriceMin : current?.suggestedPriceMin;
+    const max = payload.suggestedPriceMax !== undefined ? payload.suggestedPriceMax : current?.suggestedPriceMax;
+    if (min != null && max != null && min > max) {
+      throw new AppError(
+        StatusCodes.BAD_REQUEST,
+        "Suggested minimum price cannot be higher than the maximum",
+      );
     }
   }
 
@@ -89,8 +112,23 @@ const remove = async (id: string) => {
   return category;
 };
 
+/** Throws if an hourly `rate` is below the category's minimum hourly rate. */
+const assertMinHourlyRate = async (categoryId: unknown, rate: unknown) => {
+  const id = categoryId != null ? String((categoryId as any)?._id ?? categoryId) : "";
+  if (!id || !Types.ObjectId.isValid(id) || rate == null) return;
+  const category = await CategoryRepository.findById(id);
+  const min = Number(category?.minHourlyRate) || 0;
+  if (category && min > 0 && Number(rate) < min) {
+    throw new AppError(
+      StatusCodes.BAD_REQUEST,
+      `Minimum rate for ${category.name} is ${min} MAD/hour`,
+    );
+  }
+};
+
 export const CategoryService = {
   create,
+  assertMinHourlyRate,
   getAll,
   getAllAdmin,
   getById,

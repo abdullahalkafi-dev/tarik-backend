@@ -3,6 +3,7 @@ import AppError from "errors/AppError";
 import { UserRepository } from "./user.repository";
 import { AuthRepository } from "module/auth/auth.repository";
 import { HelperApplicationStatus } from "./user.interface";
+import { CategoryService } from "module/category/category.service";
 import cacheService from "redis/cacheService";
 import { buildCacheKey } from "redis/cache.utils";
 import { resolveUrl } from "util/minio";
@@ -139,6 +140,13 @@ const updateProfile = async (
     );
   }
 
+  if (payload.pricePerHour != null || payload.serviceType != null) {
+    await CategoryService.assertMinHourlyRate(
+      payload.serviceType ?? existingUser.serviceType,
+      payload.pricePerHour ?? existingUser.pricePerHour,
+    );
+  }
+
   const updatedUser = await UserRepository.updateById(userId, updateData);
   if (!updatedUser) {
     throw new AppError(StatusCodes.NOT_FOUND, "User not found");
@@ -237,6 +245,8 @@ const helperApply = async (userId: string, payload: THelperApplyPayload) => {
     throw new AppError(StatusCodes.BAD_REQUEST, "Please set your location first");
   }
 
+  await CategoryService.assertMinHourlyRate(payload.serviceType, payload.pricePerHour);
+
   // Build history entry
   const historyEntry = {
     appliedAt: new Date(),
@@ -305,6 +315,37 @@ type THelperSearchQuery = {
   limit?: number;
 };
 
+// Fields needed to render a helper card. KYC fields are read only to derive
+// `isVerified` and are stripped before the response (see toHelperCard).
+const HELPER_CARD_FIELDS =
+  "name avatar address location pricePerHour experience serviceRadius bio city language serviceType rating reviewCount profilePhotos helperApplicationStatus diditStatus documentUrl";
+
+/** Approved helper whose identity passed automated KYC or a manual document review. */
+const isIdentityVerified = (u: any): boolean =>
+  u?.helperApplicationStatus === HelperApplicationStatus.APPROVED &&
+  (String(u?.diditStatus || "").toLowerCase() === "approved" || !!u?.documentUrl);
+
+const resolvePhotos = (photos?: string[]): string[] =>
+  (photos || []).map(resolveUrl).filter(Boolean) as string[];
+
+const toHelperCard = (h: any) => {
+  const obj = typeof h?.toObject === "function" ? h.toObject() : { ...h };
+  const isVerified = isIdentityVerified(obj);
+  const workPhotos = resolvePhotos(obj.profilePhotos).slice(0, 3);
+  delete obj.diditStatus;
+  delete obj.documentUrl;
+  delete obj.helperApplicationStatus;
+  delete obj.profilePhotos;
+  return {
+    ...obj,
+    avatar: resolveUrl(obj.avatar),
+    isVerified,
+    workPhotos,
+    rating: Number(obj.rating) || 0,
+    reviewCount: Number(obj.reviewCount) || 0,
+  };
+};
+
 const searchHelpers = async (query: THelperSearchQuery) => {
   const filter: any = {
     isHelperFormSubmitted: true,
@@ -355,7 +396,7 @@ const searchHelpers = async (query: THelperSearchQuery) => {
   let [helpers, total] = await Promise.all([
     UserRepository.findMany(filter, {
       select:
-        "name avatar address location pricePerHour experience serviceRadius bio city language serviceType rating reviewCount",
+        HELPER_CARD_FIELDS,
       // $near already sorts by distance — skip explicit sort for geo queries
       ...(hasGeo ? {} : { sort: { createdAt: -1 } }),
       skip,
@@ -372,7 +413,7 @@ const searchHelpers = async (query: THelperSearchQuery) => {
     [helpers, total] = await Promise.all([
       UserRepository.findMany(fallbackFilter, {
         select:
-          "name avatar address location pricePerHour experience serviceRadius bio city language serviceType rating reviewCount",
+          HELPER_CARD_FIELDS,
         sort: { rating: -1, createdAt: -1 },
         skip,
         limit,
@@ -382,11 +423,7 @@ const searchHelpers = async (query: THelperSearchQuery) => {
     ]);
   }
 
-  // Resolve avatar keys to full URLs
-  const resolvedHelpers = helpers.map((h: any) => ({
-    ...h.toObject(),
-    avatar: resolveUrl(h.avatar),
-  }));
+  const resolvedHelpers = helpers.map(toHelperCard);
 
   return {
     helpers: resolvedHelpers,
@@ -401,7 +438,7 @@ const searchHelpers = async (query: THelperSearchQuery) => {
 const getHelperProfile = async (userId: string) => {
   const user = await UserRepository.findById(userId, {
     select:
-      "name avatar bio serviceType pricePerHour experience serviceRadius address city language profilePhotos createdAt isHelperFormSubmitted helperApplicationStatus",
+      "name avatar bio serviceType pricePerHour experience serviceRadius address city language profilePhotos createdAt isHelperFormSubmitted helperApplicationStatus diditStatus documentUrl rating reviewCount",
     populate: "serviceType",
   });
 
@@ -425,9 +462,10 @@ const getHelperProfile = async (userId: string) => {
     address: user.address,
     city: user.city,
     language: user.language,
-    profilePhotos: user.profilePhotos
-      ?.map(resolveUrl)
-      .filter(Boolean) as string[],
+    profilePhotos: resolvePhotos(user.profilePhotos),
+    rating: Number(user.rating) || 0,
+    reviewCount: Number(user.reviewCount) || 0,
+    isVerified: isIdentityVerified(user),
     createdAt: user.createdAt,
   };
 };

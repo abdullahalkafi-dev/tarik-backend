@@ -111,9 +111,17 @@ const forwardGeocode = async (
     url.searchParams.append("q", query);
     url.searchParams.append("limit", String(limit));
     url.searchParams.append("apiKey", config.here.api_key);
-    if (config.geo.allowed_countries) {
-      url.searchParams.append("in", `countryCode:${config.geo.allowed_countries}`);
+    // HERE only accepts ISO 3166-1 alpha-3 codes here; a stray 2-letter code
+    // (e.g. "GB") makes the whole request fail and search returns nothing.
+    const alpha3 = config.geo.allowed_countries
+      .split(",")
+      .map((c) => c.trim().toUpperCase())
+      .filter((c) => /^[A-Z]{3}$/.test(c));
+    if (alpha3.length) {
+      url.searchParams.append("in", `countryCode:${alpha3.join(",")}`);
     }
+    // Rank Moroccan results first (Casablanca) for ambiguous queries.
+    url.searchParams.append("at", "33.5731,-7.5898");
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);

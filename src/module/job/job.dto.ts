@@ -1,4 +1,5 @@
 import z from "zod";
+import { refineTimeRange } from "../../util/hourly";
 
 const createJobDto = z.object({
   body: z
@@ -17,7 +18,8 @@ const createJobDto = z.object({
       images: z.array(z.string()).max(4).optional(),
       category: z.string().min(1, "Category is required"),
     })
-    .strict(),
+    .strict()
+    .superRefine(refineTimeRange),
 });
 
 const updateJobDto = z.object({

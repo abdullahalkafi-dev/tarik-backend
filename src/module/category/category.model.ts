@@ -6,6 +6,10 @@ const categorySchema = new Schema<TCategory>(
     name: { type: String, required: true, unique: true, trim: true },
     icon: { type: String },
     isActive: { type: Boolean, default: true },
+    // Price guidance shown to clients/helpers and enforced for hourly rates
+    minHourlyRate: { type: Number, min: 0, default: null },
+    suggestedPriceMin: { type: Number, min: 0, default: null },
+    suggestedPriceMax: { type: Number, min: 0, default: null },
   },
   { timestamps: true },
 );

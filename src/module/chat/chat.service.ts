@@ -6,7 +6,7 @@ import { JobRepository } from "module/job/job.repository";
 import { UserRepository } from "module/user/user.repository";
 import { resolveUrl } from "../../util/minio";
 import { notifyUser } from "../../util/notifyUser";
-import { calcHourlyTotalMAD, parseHoursBetween } from "../../util/hourly";
+import { calcHourlyTotalMAD, parseHoursBetween, validateTimeRange } from "../../util/hourly";
 import {
   MessageType,
   OfferStatus,
@@ -980,6 +980,8 @@ const editOffer = async (
   const effectivePriceType = payload.priceType != null ? payload.priceType : oldOffer.priceType;
   const effectiveStartTime = payload.startTime != null ? payload.startTime : oldOffer.startTime;
   const effectiveEndTime = payload.endTime != null ? payload.endTime : oldOffer.endTime;
+  const timeError = validateTimeRange(effectiveStartTime, effectiveEndTime);
+  if (timeError) throw new AppError(StatusCodes.BAD_REQUEST, timeError);
   const effectivePaymentMethod = (payload.paymentMethod != null ? payload.paymentMethod : oldOffer.paymentMethod) as PaymentMethod;
 
   const { commission: newCommission } = await calculateOfferBudgetAndCommission({

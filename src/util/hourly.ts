@@ -37,9 +37,46 @@ export function parseHoursBetween(
   const b = parseTimeToMinutes(endTime);
   if (a == null || b == null) return null;
   let mins = b - a;
-  if (mins <= 0) mins += 24 * 60; // overnight
-  if (mins <= 0) return null;
+  // Equal times used to wrap to a 24h job. New bookings are rejected by
+  // validateTimeRange; negative ranges still wrap for legacy overnight offers.
+  if (mins === 0) return null;
+  if (mins < 0) mins += 24 * 60; // legacy overnight
   return mins / 60;
+}
+
+/** Shortest bookable slot. Mirrors AppDateTime.minBookingMinutes in the app. */
+export const MIN_BOOKING_MINUTES = 30;
+
+/**
+ * Error message for an invalid start/end pair, or null if acceptable.
+ * Both missing is allowed; one missing, end <= start, or a slot shorter
+ * than MIN_BOOKING_MINUTES is not.
+ */
+export function validateTimeRange(
+  startTime?: string | null,
+  endTime?: string | null,
+): string | null {
+  const hasStart = !!startTime && String(startTime).trim() !== "";
+  const hasEnd = !!endTime && String(endTime).trim() !== "";
+  if (!hasStart && !hasEnd) return null;
+  if (!hasStart || !hasEnd) return "Both start time and end time are required";
+  const a = parseTimeToMinutes(startTime);
+  const b = parseTimeToMinutes(endTime);
+  if (a == null || b == null) return "Invalid time format";
+  if (b <= a) return "End time must be after start time";
+  if (b - a < MIN_BOOKING_MINUTES) {
+    return `Booking must be at least ${MIN_BOOKING_MINUTES} minutes long`;
+  }
+  return null;
+}
+
+/** Zod superRefine for a body with optional startTime/endTime fields. */
+export function refineTimeRange(
+  data: { startTime?: string; endTime?: string },
+  ctx: { addIssue: (issue: { code: "custom"; message: string; path: string[] }) => void },
+): void {
+  const error = validateTimeRange(data.startTime, data.endTime);
+  if (error) ctx.addIssue({ code: "custom", message: error, path: ["endTime"] });
 }
 
 /**

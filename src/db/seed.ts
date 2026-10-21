@@ -7,16 +7,20 @@ import { logger } from "../logger/logger";
 import config from "../config";
 
 // Official production categories matching https://tarikappapi.joura.info/api/v1/categories
+// Price guidance in MAD: starting estimates for the Moroccan market.
+// Admins tune these in Dashboard → Categories; the seed only fills empty values.
 export const PRD_CATEGORIES = [
-  { name: "Home Cleaning", icon: "cleaning_icon.svg" },
-  { name: "Furniture Assembly & DIY", icon: "furniture_assembly_icon.svg" },
-  { name: "Gardening & Plant Care", icon: "garden_icon.svg" },
-  { name: "Tech Support & Devices", icon: "tech_support_icon.svg" },
-  { name: "Tutoring & Education", icon: "tutoring_icon.svg" },
-  { name: "Pet Care & Walking", icon: "pet_care_icon.svg" },
-  { name: "Tailoring & Alterations", icon: "tailoring_icon.svg" },
-  { name: "Event & Hospitality", icon: "event_helper_icon.svg" },
+  { name: "Home Cleaning", icon: "cleaning_icon.svg", minHourlyRate: 50, suggestedPriceMin: 150, suggestedPriceMax: 400 },
+  { name: "Furniture Assembly & DIY", icon: "furniture_assembly_icon.svg", minHourlyRate: 70, suggestedPriceMin: 150, suggestedPriceMax: 500 },
+  { name: "Gardening & Plant Care", icon: "garden_icon.svg", minHourlyRate: 50, suggestedPriceMin: 150, suggestedPriceMax: 400 },
+  { name: "Tech Support & Devices", icon: "tech_support_icon.svg", minHourlyRate: 80, suggestedPriceMin: 100, suggestedPriceMax: 400 },
+  { name: "Tutoring & Education", icon: "tutoring_icon.svg", minHourlyRate: 60, suggestedPriceMin: 100, suggestedPriceMax: 300 },
+  { name: "Pet Care & Walking", icon: "pet_care_icon.svg", minHourlyRate: 40, suggestedPriceMin: 50, suggestedPriceMax: 200 },
+  { name: "Tailoring & Alterations", icon: "tailoring_icon.svg", minHourlyRate: 50, suggestedPriceMin: 50, suggestedPriceMax: 300 },
+  { name: "Event & Hospitality", icon: "event_helper_icon.svg", minHourlyRate: 60, suggestedPriceMin: 300, suggestedPriceMax: 1000 },
 ];
+
+const PRICING_KEYS = ["minHourlyRate", "suggestedPriceMin", "suggestedPriceMax"] as const;
 
 export const seedCategories = async (): Promise<Map<string, any>> => {
   logger.info("📦 [SEED CATEGORIES] Starting category sync with official PRD categories...");
@@ -29,9 +33,21 @@ export const seedCategories = async (): Promise<Map<string, any>> => {
         name: cat.name,
         icon: cat.icon,
         isActive: true,
+        minHourlyRate: cat.minHourlyRate,
+        suggestedPriceMin: cat.suggestedPriceMin,
+        suggestedPriceMax: cat.suggestedPriceMax,
       });
       logger.info(`  ✅ Created category: "${cat.name}" | ID: ${existing._id}`);
     } else {
+      // Backfill price guidance without overwriting values set by an admin.
+      const missing: Record<string, number> = {};
+      for (const key of PRICING_KEYS) {
+        if (existing.get(key) == null) missing[key] = cat[key];
+      }
+      if (Object.keys(missing).length) {
+        await Category.updateOne({ _id: existing._id }, { $set: missing });
+        Object.assign(existing, missing);
+      }
       logger.info(`  ℹ️ Found existing category: "${cat.name}" | ID: ${existing._id}`);
     }
     categoryMap.set(cat.name, existing);
@@ -113,14 +129,14 @@ export const seedHelpersAndUsers = async (categoryMap: Map<string, any>): Promis
       category: cleaningCategory,
       categoryName: cleaningCategory?.name || "Home Cleaning",
       age: 29,
-      city: "London",
-      language: "English",
+      city: "Casablanca",
+      language: "Arabic, French",
       pricePerHour: 120,
       experience: 6,
       serviceRadius: 40,
-      bio: "Professional home and office cleaning specialist with 6+ years of experience. Providing deep sanitization, eco-friendly cleaning, and move-in/out services across London.",
-      coordinates: [-0.1419, 51.5014], // Westminster, London
-      address: "Westminster, London, UK",
+      bio: "Professional home and office cleaning specialist with 6+ years of experience. Providing deep sanitization, eco-friendly cleaning, and move-in/out services across Casablanca.",
+      coordinates: [-7.633, 33.5822], // Maârif, Casablanca
+      address: "Maârif, Casablanca, Morocco",
       rating: 4.9,
       reviewCount: 24,
     },
@@ -131,14 +147,14 @@ export const seedHelpersAndUsers = async (categoryMap: Map<string, any>): Promis
       category: furnitureCategory,
       categoryName: furnitureCategory?.name || "Furniture Assembly & DIY",
       age: 34,
-      city: "London",
-      language: "English",
+      city: "Casablanca",
+      language: "Arabic, French",
       pricePerHour: 140,
       experience: 8,
       serviceRadius: 40,
       bio: "Expert handyman and furniture assembly professional. Flat-pack assembly (IKEA, Wayfair), wall mounting, shelf installation, and general home repairs.",
-      coordinates: [-0.1426, 51.539], // Camden, London
-      address: "Camden, London, UK",
+      coordinates: [-7.6192, 33.5731], // Gauthier, Casablanca
+      address: "Gauthier, Casablanca, Morocco",
       rating: 4.8,
       reviewCount: 19,
     },
@@ -149,14 +165,14 @@ export const seedHelpersAndUsers = async (categoryMap: Map<string, any>): Promis
       category: techCategory,
       categoryName: techCategory?.name || "Tech Support & Devices",
       age: 27,
-      city: "London",
-      language: "English",
+      city: "Rabat",
+      language: "Arabic, French, English",
       pricePerHour: 110,
       experience: 5,
       serviceRadius: 40,
       bio: "Certified smart home & device setup specialist. Wi-Fi network configuration, smart TV mounting, security camera installation, and troubleshooting.",
-      coordinates: [-0.1932, 51.5007], // Kensington, London
-      address: "Kensington, London, UK",
+      coordinates: [-6.851, 33.9993], // Agdal, Rabat
+      address: "Agdal, Rabat, Morocco",
       rating: 5.0,
       reviewCount: 32,
     },
@@ -250,6 +266,10 @@ export const seedHelpersAndUsers = async (categoryMap: Map<string, any>): Promis
                 coordinates: h.coordinates,
               },
               address: h.address,
+              city: h.city,
+              language: h.language,
+              rating: h.rating,
+              reviewCount: h.reviewCount,
               pricePerHour: h.pricePerHour,
               experience: h.experience,
               serviceRadius: h.serviceRadius,
@@ -271,15 +291,15 @@ export const seedHelpersAndUsers = async (categoryMap: Map<string, any>): Promis
       phone: "+212698765431",
       email: "omar.client@tarik.test",
       name: "Omar Tazi",
-      coordinates: [-0.1365, 51.5136], // Soho, London
-      address: "Soho, London, UK",
+      coordinates: [-7.64, 33.588], // Racine, Casablanca
+      address: "Racine, Casablanca, Morocco",
     },
     {
       phone: "+212698765432",
       email: "sara.client@tarik.test",
       name: "Sara El Fassi",
-      coordinates: [-0.124, 51.5117], // Covent Garden, London
-      address: "Covent Garden, London, UK",
+      coordinates: [-6.834, 34.02], // Hassan, Rabat
+      address: "Hassan, Rabat, Morocco",
     },
   ];
 

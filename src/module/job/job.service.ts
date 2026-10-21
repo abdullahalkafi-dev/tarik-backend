@@ -4,6 +4,7 @@ import { Types } from "mongoose";
 import { JobRepository } from "./job.repository";
 import { UserRepository } from "../user/user.repository";
 import { CategoryRepository } from "../category/category.repository";
+import { CategoryService } from "../category/category.service";
 import { JobStatus, PaymentMethod } from "./job.interface";
 import { emitToUser } from "../../socket/socket.gateway";
 import { sendFCMMulticast } from "../../util/firebase";
@@ -11,6 +12,7 @@ import { notifyUser } from "../../util/notifyUser";
 import { NotificationRepository } from "../notification/notification.repository";
 import { NotificationAudience } from "../notification/notification.interface";
 import { logger } from "../../logger/logger";
+import { validateTimeRange } from "../../util/hourly";
 
 type TCreateJobPayload = {
   title: string;
@@ -154,6 +156,9 @@ const createJob = async (userId: string, payload: TCreateJobPayload) => {
       StatusCodes.BAD_REQUEST,
       `Minimum job budget is ${minBudget} MAD`,
     );
+  }
+  if (payload.budgetType === "hourly") {
+    await CategoryService.assertMinHourlyRate(category._id, payload.budget);
   }
 
   const jobData: any = {
@@ -319,6 +324,12 @@ const updateJob = async (
       "You can only update your own jobs",
     );
   }
+
+  const timeError = validateTimeRange(
+    payload.startTime ?? job.startTime,
+    payload.endTime ?? job.endTime,
+  );
+  if (timeError) throw new AppError(StatusCodes.BAD_REQUEST, timeError);
 
   const updateData: any = {};
   if (payload.title) updateData.title = payload.title;

@@ -1,4 +1,5 @@
 import z from "zod";
+import { refineTimeRange } from "../../util/hourly";
 
 // ─── ObjectId param validator ──────────────────────────
 const objectIdParam = z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid ID format");
@@ -64,7 +65,8 @@ const sendOfferDto = z.object({
       paymentMethod: z.enum(["cash", "online"]).default("cash"),
       images: z.array(z.string()).max(4).optional(),
     })
-    .strict(),
+    .strict()
+    .superRefine(refineTimeRange),
 });
 
 // ─── Edit Offer (params + body) ───────────────────────
@@ -155,7 +157,8 @@ const sendOfferWithParamsDto = z.object({
       paymentMethod: z.enum(["cash", "online"]).default("cash"),
       images: z.array(z.string()).max(4).optional(),
     })
-    .strict(),
+    .strict()
+    .superRefine(refineTimeRange),
 });
 
 export const ChatDto = {
