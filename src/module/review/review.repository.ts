@@ -14,7 +14,6 @@ export const ReviewRepository = {
       : revieweeId;
     return Review.find({ reviewee: revieweeOid })
       .populate("reviewer", "name avatar")
-      .populate("job", "title")
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)

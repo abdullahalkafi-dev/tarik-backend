@@ -58,14 +58,24 @@ const getApplicationStatus = catchAsync(async (req, res) => {
   });
 });
 
+const numOrUndef = (v: unknown): number | undefined => {
+  if (v === undefined || v === null || v === "") return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+};
+
 const searchHelpers = catchAsync(async (req, res) => {
   const result = await UserService.searchHelpers({
     category: req.query.category as string | undefined,
-    maxDistance: Number(req.query.maxDistance) || undefined,
-    latitude: Number(req.query.lat) || undefined,
-    longitude: Number(req.query.lon) || undefined,
-    page: Number(req.query.page) || 1,
-    limit: Number(req.query.limit) || 20,
+    maxDistance: numOrUndef(req.query.maxDistance),
+    minRating: numOrUndef(req.query.minRating),
+    maxPrice: numOrUndef(req.query.maxPrice),
+    sort: req.query.sort as any,
+    search: req.query.search as string | undefined,
+    latitude: numOrUndef(req.query.lat),
+    longitude: numOrUndef(req.query.lon),
+    page: numOrUndef(req.query.page) || 1,
+    limit: numOrUndef(req.query.limit) || 20,
   });
 
   sendResponse(res, {
@@ -77,7 +87,10 @@ const searchHelpers = catchAsync(async (req, res) => {
 });
 
 const getHelperProfile = catchAsync(async (req, res) => {
-  const result = await UserService.getHelperProfile(req.params.id as string);
+  const result = await UserService.getHelperProfile(req.params.id as string, {
+    latitude: numOrUndef(req.query.lat),
+    longitude: numOrUndef(req.query.lon),
+  });
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -105,6 +118,7 @@ const registerDeviceToken = catchAsync(async (req, res) => {
   const result = await UserService.registerDeviceToken(req.user?._id as string, {
     token: req.body.token,
     platform: req.body.platform,
+    locale: req.body.locale,
   });
 
   sendResponse(res, {
@@ -116,7 +130,7 @@ const registerDeviceToken = catchAsync(async (req, res) => {
 });
 
 const clearDeviceToken = catchAsync(async (req, res) => {
-  const result = await UserService.clearDeviceToken(req.user?._id as string);
+  const result = await UserService.clearDeviceToken(req.user?._id as string, req.body?.token);
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -126,7 +140,43 @@ const clearDeviceToken = catchAsync(async (req, res) => {
   });
 });
 
+const setAvailability = catchAsync(async (req, res) => {
+  const result = await UserService.setAvailability(req.user?._id as string, req.body.isAvailable);
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Availability updated",
+    data: result,
+  });
+});
+
+const acceptLegal = catchAsync(async (req, res) => {
+  const result = await UserService.acceptLegal(req.user?._id as string, req.body.version);
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Terms accepted",
+    data: result,
+  });
+});
+
+const deleteAccount = catchAsync(async (req, res) => {
+  const result = await UserService.deleteAccount(req.user?._id as string, req.body.password);
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: result.message,
+    data: null,
+  });
+});
+
 export const UserController = {
+  setAvailability,
+  acceptLegal,
+  deleteAccount,
   getMe,
   updateProfile,
   updateLocation,

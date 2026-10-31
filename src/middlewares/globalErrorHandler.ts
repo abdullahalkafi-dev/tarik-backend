@@ -46,9 +46,30 @@ const globalErrorHandler: ErrorRequestHandler = (err, req, res, _next): void => 
     statusCode = err.statusCode;
     message = err.message;
     errorSources = err.errorSources || [{ path: "", message: err.message }];
+  } else if (err?.type === "entity.parse.failed") {
+    statusCode = 400;
+    message = "Invalid JSON in request body";
+    errorSources = [{ path: "", message }];
+  } else if (err?.type === "entity.too.large" || err?.code === "LIMIT_FILE_SIZE") {
+    statusCode = 413;
+    message = "The request or file is too large";
+    errorSources = [{ path: "", message }];
+  } else if (err?.name === "MulterError") {
+    statusCode = 400;
+    message = err.message || "Invalid upload";
+    errorSources = [{ path: err.field || "", message }];
   } else if (err instanceof Error) {
-    message = err.message;
-    errorSources = [{ path: "", message: err.message }];
+    // Honour 4xx statuses set by libraries (body-parser, etc.); anything else
+    // is an unexpected server error and its text is never sent to the client.
+    const libStatus = Number((err as any).status || (err as any).statusCode);
+    if (libStatus >= 400 && libStatus < 500) {
+      statusCode = libStatus;
+      message = err.message;
+      errorSources = [{ path: "", message: err.message }];
+    } else if (config.node_env === "development") {
+      message = err.message;
+      errorSources = [{ path: "", message: err.message }];
+    }
   }
 
   res.locals.errorMessage = err.message;
@@ -67,6 +88,8 @@ const globalErrorHandler: ErrorRequestHandler = (err, req, res, _next): void => 
     success: false,
     message,
     errorSources,
+    ...(err instanceof AppError && err.code ? { code: err.code } : {}),
+    ...(err instanceof AppError && err.params ? { params: err.params } : {}),
     ...(err instanceof AppError && err.details ? { details: err.details } : {}),
     stack: config.node_env === "development" ? err?.stack : null,
   });

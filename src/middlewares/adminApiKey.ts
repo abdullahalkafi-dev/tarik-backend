@@ -4,18 +4,10 @@ import { StatusCodes } from "http-status-codes";
 import config from "../config";
 
 const extractApiKey = (req: Request): string => {
-  const queryKeyRaw = req.query.adminKey || req.query.apiKey || req.query.key;
-  const queryKey = typeof queryKeyRaw === "string" ? queryKeyRaw.trim() : "";
-
-  if (queryKey) return queryKey;
-
+  // Header only: a key in the URL ends up in access logs, proxies and history.
+  // The Authorization header is reserved for user JWTs.
   const directKey = req.header("x-admin-key") || req.header("x-api-key");
-  if (directKey) return directKey.trim();
-
-  const authHeader = req.header("authorization") || "";
-  if (!authHeader.toLowerCase().startsWith("bearer ")) return "";
-
-  return authHeader.slice(7).trim();
+  return directKey ? directKey.trim() : "";
 };
 
 const secureEquals = (a: string, b: string): boolean => {

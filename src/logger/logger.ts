@@ -12,14 +12,14 @@ const customFormat = printf((info) => {
   const { level, message, label, timestamp, stack } = info;
   const date = new Date(timestamp as string);
   const dateStr = date.toLocaleDateString("en-US", {
-    timeZone: "Asia/Dhaka",
+    timeZone: "Africa/Casablanca",
     weekday: "short",
     year: "numeric",
     month: "short",
     day: "numeric",
   });
   const timeStr = date.toLocaleTimeString("en-US", {
-    timeZone: "Asia/Dhaka",
+    timeZone: "Africa/Casablanca",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -58,15 +58,8 @@ const logger = createLogger({
       zippedArchive: true,
     }),
   ],
-  rejectionHandlers: [
-    new DailyRotateFile({
-      filename: path.join(LOG_DIR, "rejections", "%DATE%-rejections.log"),
-      datePattern: "DD-MM-YYYY",
-      maxSize: "20m",
-      maxFiles: "14d",
-      zippedArchive: true,
-    }),
-  ],
+  // Unhandled promise rejections are logged (not fatal) by server.ts; winston's
+  // own rejection handler would exit the process, so it is intentionally absent.
 });
 
 const errorLogger = createLogger({

@@ -5,19 +5,21 @@ import config from "config";
 import { verifyJwtToken } from "jwt";
 import { UserRepository } from "module/user/user.repository";
 
+/**
+ * The token is accepted from the handshake `auth` payload or the Authorization
+ * header only. A `?token=` query string is NOT accepted: URLs end up in proxy
+ * and access logs.
+ */
 const extractToken = (socket: Socket): string | null => {
-  const authToken = socket.handshake.auth.token;
+  const authToken = socket.handshake.auth?.token;
   const authorizationHeader = socket.handshake.headers.authorization;
-  const queryToken = socket.handshake.query.token;
 
   const rawToken =
     typeof authToken === "string"
       ? authToken
       : typeof authorizationHeader === "string"
         ? authorizationHeader
-        : typeof queryToken === "string"
-          ? queryToken
-          : null;
+        : null;
 
   if (!rawToken) return null;
   return rawToken.startsWith("Bearer ") ? rawToken.slice(7) : rawToken;
@@ -32,19 +34,33 @@ export const socketAuthMiddleware = async (
     if (!token) return next(new Error("Unauthorized"));
 
     const decoded = verifyJwtToken(token, config.jwt.jwt_secret as Secret);
-    const user = await UserRepository.findById(decoded.userId, { populate: "auth" });
+    if (decoded.type || !decoded.userId) return next(new Error("Unauthorized"));
 
-    if (!user || user.isDeleted || user.isBlocked || (user.auth as any)?.isBlacklisted || (user.auth as any)?.isDeleted) {
+    const user = await UserRepository.findById(decoded.userId, { populate: "auth" });
+    const authDoc = (user?.auth as any) || null;
+
+    if (
+      !user ||
+      !authDoc ||
+      user.isDeleted ||
+      user.isBlocked ||
+      authDoc.isBlacklisted ||
+      authDoc.isDeleted ||
+      authDoc.status === "suspended"
+    ) {
       return next(new Error("Unauthorized: Account suspended or blacklisted"));
     }
 
+    if ((decoded.tv ?? 0) !== (authDoc.tokenVersion ?? 0)) {
+      return next(new Error("Unauthorized: session ended"));
+    }
+
     socket.data.userId = String(user._id);
-    socket.data.user = user;
-    // Mirror HTTP auth: role lives on Auth JWT, not the User document.
-    socket.data.isSuperAdmin = Boolean(decoded.isSuperAdmin);
-    socket.data.role = decoded.isSuperAdmin
-      ? "superAdmin"
-      : decoded.role || "user";
+    socket.data.authId = String(authDoc._id);
+    socket.data.isSuperAdmin = Boolean(authDoc.isSuperAdmin);
+    // Role comes from the database (same rule as the HTTP middleware).
+    socket.data.role = authDoc.isSuperAdmin ? "superAdmin" : authDoc.role || "user";
+    socket.data.approvedHelper = user.helperApplicationStatus === "approved";
 
     next();
   } catch {

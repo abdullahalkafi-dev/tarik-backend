@@ -1,116 +1,63 @@
 import { Router } from "express";
 import validateRequest from "@middlewares/validateRequest";
+import auth from "@middlewares/auth";
 import { AuthController } from "./auth.controller";
 import { AuthDto } from "./auth.dto";
-import { authLimiter } from "@middlewares/security";
+import { authLimiter, createLimiter } from "@middlewares/security";
 
 const router = Router();
 
-/**
- * @route   POST /api/v1/auth/register
- * @desc    Register with email and password (sends OTP)
- * @access  Public
- */
-router.post(
-  "/register",
-  authLimiter,
-  validateRequest(AuthDto.register),
-  AuthController.register,
-);
-
-/**
- * @route   POST /api/v1/auth/verify-otp
- * @desc    Verify email with OTP
- * @access  Public
- */
-router.post(
-  "/verify-otp",
-  authLimiter,
-  validateRequest(AuthDto.verifyOtp),
-  AuthController.verifyOtp,
-);
-
-/**
- * @route   POST /api/v1/auth/resend-otp
- * @desc    Resend verification OTP
- * @access  Public
- */
-router.post(
-  "/resend-otp",
-  authLimiter,
-  validateRequest(AuthDto.resendOtp),
-  AuthController.resendOtp,
-);
+const refreshLimiter = createLimiter({
+  name: "refresh-token",
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  message: "Too many token refreshes, please try again later.",
+});
 
 /**
  * @route   POST /api/v1/auth/login
- * @desc    Login with email and password
+ * @desc    E-mail + password login (admin / staff accounts only)
  * @access  Public
  */
-router.post(
-  "/login",
-  authLimiter,
-  validateRequest(AuthDto.login),
-  AuthController.login,
-);
-
-/**
- * @route   POST /api/v1/auth/google-login
- * @desc    Login with Google (auto-verified)
- * @access  Public
- */
-router.post(
-  "/google-login",
-  authLimiter,
-  validateRequest(AuthDto.googleLogin),
-  AuthController.googleLogin,
-);
+router.post("/login", authLimiter, validateRequest(AuthDto.login), AuthController.login);
 
 /**
  * @route   POST /api/v1/auth/refresh-token
- * @desc    Get new access token using refresh token
+ * @desc    Get a new access token (and a renewed refresh token) using a refresh token
  * @access  Public
  */
 router.post(
   "/refresh-token",
+  refreshLimiter,
   validateRequest(AuthDto.refreshToken),
   AuthController.getAccessToken,
 );
 
 /**
- * @route   POST /api/v1/auth/forgot-password
- * @desc    Send password reset OTP
- * @access  Public
+ * @route   POST /api/v1/auth/logout
+ * @desc    End the current device session
+ * @access  Private
  */
-router.post(
-  "/forgot-password",
-  authLimiter,
-  validateRequest(AuthDto.forgotPassword),
-  AuthController.forgotPassword,
-);
+router.post("/logout", auth(), validateRequest(AuthDto.logout), AuthController.logout);
 
 /**
- * @route   POST /api/v1/auth/verify-reset-otp
- * @desc    Verify password reset OTP
- * @access  Public
+ * @route   POST /api/v1/auth/logout-all
+ * @desc    End every session of the account on all devices
+ * @access  Private
  */
-router.post(
-  "/verify-reset-otp",
-  authLimiter,
-  validateRequest(AuthDto.verifyResetOtp),
-  AuthController.verifyResetOtp,
-);
+router.post("/logout-all", auth(), AuthController.logoutAll);
 
 /**
- * @route   POST /api/v1/auth/reset-password
- * @desc    Reset password with token
- * @access  Public
+ * @route   POST /api/v1/auth/change-password
+ * @desc    Change password (logs out all other devices, returns fresh tokens)
+ * @access  Private
  */
 router.post(
-  "/reset-password",
+  "/change-password",
   authLimiter,
-  validateRequest(AuthDto.resetPassword),
-  AuthController.resetPassword,
+  auth(),
+  validateRequest(AuthDto.changePassword),
+  AuthController.changePassword,
 );
 
 /**

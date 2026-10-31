@@ -1,6 +1,7 @@
 import { Client as MinioClient } from "minio";
 import { logger } from "../logger/logger";
 import config from "../config";
+import { isPrivateKey, signFileKey } from "./uploadKey";
 
 let minioClient: MinioClient | null = null;
 
@@ -19,26 +20,37 @@ const getMinioClient = (): MinioClient => {
 
 const BUCKET = config.minio.bucket;
 
+/**
+ * Only avatars, job/chat photos, videos and category icons may be read
+ * anonymously at MinIO level. Everything else (KYC `documents/`) has no public
+ * rule: it is reachable only through the API with a signed link.
+ */
+const buildPublicReadPolicy = () => ({
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: { AWS: ["*"] },
+      Action: ["s3:GetObject"],
+      Resource: [
+        `arn:aws:s3:::${BUCKET}/images/*`,
+        `arn:aws:s3:::${BUCKET}/videos/*`,
+        `arn:aws:s3:::${BUCKET}/icons/*`,
+        `arn:aws:s3:::${BUCKET}/*.svg`,
+      ],
+    },
+  ],
+});
+
 export const ensureBucket = async (): Promise<void> => {
   const client = getMinioClient();
   const exists = await client.bucketExists(BUCKET);
   if (!exists) {
     await client.makeBucket(BUCKET, "us-east-1");
-    // Set public read policy for the bucket
-    const policy = {
-      Version: "2012-10-17",
-      Statement: [
-        {
-          Effect: "Allow",
-          Principal: { AWS: ["*"] },
-          Action: ["s3:GetObject"],
-          Resource: [`arn:aws:s3:::${BUCKET}/*`],
-        },
-      ],
-    };
-    await client.setBucketPolicy(BUCKET, JSON.stringify(policy));
-    logger.info(`MinIO bucket "${BUCKET}" created with public read policy`);
+    logger.info(`MinIO bucket "${BUCKET}" created`);
   }
+  // Re-applied on every start so an older "public for everything" policy is replaced.
+  await client.setBucketPolicy(BUCKET, JSON.stringify(buildPublicReadPolicy()));
 };
 
 export const uploadToMinio = async (
@@ -53,6 +65,17 @@ export const uploadToMinio = async (
   return `${config.minio.public_url}/${BUCKET}/${key}`;
 };
 
+/** Upload from a file on disk without loading it into memory. */
+export const uploadFileToMinio = async (
+  filePath: string,
+  key: string,
+  contentType: string,
+): Promise<string> => {
+  const client = getMinioClient();
+  await client.fPutObject(BUCKET, key, filePath, { "Content-Type": contentType });
+  return `${config.minio.public_url}/${BUCKET}/${key}`;
+};
+
 export const deleteFromMinio = async (key: string): Promise<void> => {
   const client = getMinioClient();
   await client.removeObject(BUCKET, key);
@@ -63,39 +86,56 @@ export const getMinioObjectStream = async (key: string) => {
   return client.getObject(BUCKET, key);
 };
 
+/** Byte range of an object (HTTP Range support, needed by iOS video playback). */
+export const getMinioPartialObject = async (key: string, offset: number, length: number) => {
+  const client = getMinioClient();
+  return client.getPartialObject(BUCKET, key, offset, length);
+};
+
 export const getMinioObjectStat = async (key: string) => {
   const client = getMinioClient();
   return client.statObject(BUCKET, key);
 };
 
+/** Lists object keys (and modification dates) under a prefix. */
+export const listMinioObjects = (prefix: string) =>
+  getMinioClient().listObjectsV2(BUCKET, prefix, true);
+
+const fileUrl = (baseUrl: string, rawKey: string): string => {
+  const key = rawKey.split("?")[0];
+  const url = `${baseUrl}/api/v1/upload/files/${key}`;
+  if (isPrivateKey(key)) {
+    const { exp, sig } = signFileKey(key);
+    return `${url}?exp=${exp}&sig=${sig}`;
+  }
+  return url;
+};
+
 export const getMinioPublicUrl = (key: string): string => {
   const baseUrl = config.urls.api_base_url.replace(/\/+$/, "");
-  return `${baseUrl}/api/v1/upload/files/${key}`;
+  return fileUrl(baseUrl, key);
 };
 
 /**
  * Resolve a stored value to a full URL.
- * - If value is null/undefined → returns null
- * - If value starts with "http" → legacy full URL, return as-is
- * - Otherwise → treat as MinIO key and construct backend proxy URL
+ * - null/undefined → null
+ * - one of our keys or old storage URLs → API file URL (private files get a
+ *   time-limited signature)
+ * - any other http(s) URL (legacy) → returned as-is, localhost hosts rewritten
  */
 export const resolveUrl = (value: string | null | undefined): string | null => {
   if (!value) return null;
   const baseUrl = config.urls.api_base_url.replace(/\/+$/, "");
 
-  // If URL contains MinIO bucket path (/tarik-uploads/), extract key and proxy via backend
-  if (value.includes("/tarik-uploads/")) {
-    const key = value.split("/tarik-uploads/")[1];
-    return `${baseUrl}/api/v1/upload/files/${key}`;
+  const bucketMarker = `/${BUCKET}/`;
+  if (value.includes(bucketMarker)) {
+    return fileUrl(baseUrl, value.split(bucketMarker)[1]);
   }
 
-  // If URL already has backend upload path, ensure it uses active baseUrl
   if (value.includes("/api/v1/upload/files/")) {
-    const key = value.split("/api/v1/upload/files/")[1];
-    return `${baseUrl}/api/v1/upload/files/${key}`;
+    return fileUrl(baseUrl, value.split("/api/v1/upload/files/")[1]);
   }
 
-  // If already a full URL, replace any localhost/127.0.0.1/192.168.* with the configured API host
   if (value.startsWith("http://") || value.startsWith("https://")) {
     try {
       const parsed = new URL(value);
@@ -117,7 +157,7 @@ export const resolveUrl = (value: string | null | undefined): string | null => {
   }
 
   const cleanKey = value.startsWith("/") ? value.slice(1) : value;
-  return `${baseUrl}/api/v1/upload/files/${cleanKey}`;
+  return fileUrl(baseUrl, cleanKey);
 };
 
 export { getMinioClient, BUCKET };

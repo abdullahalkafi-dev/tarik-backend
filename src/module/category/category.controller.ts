@@ -14,8 +14,14 @@ const create = catchAsync(async (req, res) => {
   });
 });
 
-const getAll = catchAsync(async (_req, res) => {
-  const result = await CategoryService.getAll();
+const langOf = (req: any): string | undefined => {
+  const q = typeof req.query.lang === "string" ? req.query.lang : "";
+  const h = String(req.headers["accept-language"] || "").split(",")[0];
+  return (q || h || "").slice(0, 2).toLowerCase() || undefined;
+};
+
+const getAll = catchAsync(async (req, res) => {
+  const result = await CategoryService.getAll(langOf(req));
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -37,7 +43,7 @@ const getAllAdmin = catchAsync(async (_req, res) => {
 });
 
 const getById = catchAsync(async (req, res) => {
-  const result = await CategoryService.getById(req.params.id as string);
+  const result = await CategoryService.getById(req.params.id as string, langOf(req));
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,

@@ -11,6 +11,8 @@ const getWalletBalance = async (userId: string) => {
     balance: wallet.balance,
     currency: wallet.currency,
     transactions: recent.docs,
+    // Lifetime totals per type (the list above is only the latest page).
+    totals: await WalletRepository.totalsByType(userId),
   };
 };
 
@@ -18,8 +20,9 @@ const listTransactions = async (
   userId: string,
   page = 1,
   limit = 20,
+  type?: string,
 ) => {
-  return WalletRepository.listTransactions(userId, page, limit);
+  return WalletRepository.listTransactions(userId, page, limit, type);
 };
 
 const topupWallet = async (userId: string, amount: number) => {

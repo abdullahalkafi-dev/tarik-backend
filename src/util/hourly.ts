@@ -37,15 +37,17 @@ export function parseHoursBetween(
   const b = parseTimeToMinutes(endTime);
   if (a == null || b == null) return null;
   let mins = b - a;
-  // Equal times used to wrap to a 24h job. New bookings are rejected by
-  // validateTimeRange; negative ranges still wrap for legacy overnight offers.
+  // Equal times are invalid; an earlier end means the shift crosses midnight.
   if (mins === 0) return null;
-  if (mins < 0) mins += 24 * 60; // legacy overnight
+  if (mins < 0) mins += 24 * 60;
   return mins / 60;
 }
 
 /** Shortest bookable slot. Mirrors AppDateTime.minBookingMinutes in the app. */
 export const MIN_BOOKING_MINUTES = 30;
+
+/** Longest shift that may cross midnight. */
+export const MAX_OVERNIGHT_MINUTES = 12 * 60;
 
 /**
  * Error message for an invalid start/end pair, or null if acceptable.
@@ -63,8 +65,15 @@ export function validateTimeRange(
   const a = parseTimeToMinutes(startTime);
   const b = parseTimeToMinutes(endTime);
   if (a == null || b == null) return "Invalid time format";
-  if (b <= a) return "End time must be after start time";
-  if (b - a < MIN_BOOKING_MINUTES) {
+  // An end that is not after the start means "finishes the next day" (night
+  // shift, wedding...). That is accepted only for realistic shifts; a bigger
+  // gap is almost certainly a mistake (e.g. 5:00 PM -> 2:00 PM).
+  let minutes = b - a;
+  if (minutes <= 0) {
+    minutes += 24 * 60;
+    if (minutes > MAX_OVERNIGHT_MINUTES) return "End time must be after start time";
+  }
+  if (minutes < MIN_BOOKING_MINUTES) {
     return `Booking must be at least ${MIN_BOOKING_MINUTES} minutes long`;
   }
   return null;

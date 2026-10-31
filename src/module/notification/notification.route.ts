@@ -32,4 +32,18 @@ router.patch("/read-all", auth(), NotificationController.markAllRead);
  */
 router.patch("/:id/read", auth(), NotificationController.markRead);
 
+/**
+ * @route   DELETE /api/v1/notifications
+ * @desc    Clear all notifications of the current user
+ * @access  Private
+ */
+router.delete("/", auth(), NotificationController.removeAll);
+
+/**
+ * @route   DELETE /api/v1/notifications/:id
+ * @desc    Delete one notification
+ * @access  Private
+ */
+router.delete("/:id", auth(), NotificationController.removeOne);
+
 export const NotificationRoutes = router;

@@ -1,6 +1,6 @@
 import redisClient from "../redis/redisClient";
 import { logger } from "../logger/logger";
-import { getSocketServer } from "./socket.gateway";
+import { getSocketServer, getUserRoom } from "./socket.gateway";
 
 export type THelperLocationPing = {
   latitude: number;
@@ -29,6 +29,35 @@ export const getTrackingRoom = (jobId: string) => {
 };
 
 export const SocketTrackingService = {
+  /**
+   * The job is over (completed / cancelled): tell the watchers, close the room
+   * and detach the job from the helper's live record so nothing keeps showing
+   * "on the way" for a finished job.
+   */
+  async endJobTracking(jobId: string, helperId: string): Promise<void> {
+    try {
+      const io = getSocketServer();
+      const room = getTrackingRoom(jobId);
+      if (io) {
+        io.to(room).emit("tracking:ended", { jobId });
+        io.in(room).socketsLeave(room);
+        io.to(getUserRoom(helperId)).emit("tracking:ended", { jobId });
+      }
+      if (redisClient.isAvailable()) {
+        const raw = await redisClient.client.get(`${META_KEY_PREFIX}${helperId}`);
+        if (raw) {
+          const meta = JSON.parse(raw);
+          if (meta.jobId === jobId) {
+            meta.jobId = "";
+            await redisClient.client.setEx(`${META_KEY_PREFIX}${helperId}`, TTL_SECONDS, JSON.stringify(meta));
+          }
+        }
+      }
+    } catch (error) {
+      logger.warn(`Error ending tracking for job ${jobId}: ${error}`);
+    }
+  },
+
   async recordHelperLocation(
     helperId: string,
     payload: THelperLocationPing,

@@ -1,12 +1,19 @@
 import { StatusCodes } from "http-status-codes";
 import AppError from "errors/AppError";
 import { SupportRepository } from "./support.repository";
-import { TicketStatus } from "./support.interface";
+import { SupportTicket } from "./support.model";
+import { TicketStatus, TicketCategory, TicketPriority } from "./support.interface";
 import { UserRepository } from "module/user/user.repository";
+import { User } from "module/user/user.model";
+import { Job } from "module/job/job.model";
 import { resolveUrl } from "util/minio";
-import { notifyUser } from "util/notifyUser";
+import { notifyUserT } from "util/notifyUser";
 import { notifyAdmins } from "util/notifyAdmins";
-import { logger } from "logger/logger";
+import { assertOwnUploadKeys } from "util/uploadKey";
+import { emitToUser, getSocketServer } from "../../socket/socket.gateway";
+
+const REOPEN_WINDOW_DAYS = 7;
+const idOf = (v: any): string => String(v?._id ?? v ?? "");
 
 /** Live role: Auth.role if populated, else helper application status. */
 const resolveLiveUserRole = (user: any): "user" | "helper" => {
@@ -19,23 +26,41 @@ const resolveLiveUserRole = (user: any): "user" | "helper" => {
   return "user";
 };
 
+const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 // ─── Helper: Resolve avatar URLs in ticket/user objects ─────
-const resolveTicketUrls = (ticket: any) => {
+const resolveTicketUrls = (ticket: any, opts: { forStaff?: boolean; viewerId?: string } = {}) => {
   if (!ticket) return ticket;
-  if (ticket.user) {
-    const liveRole = resolveLiveUserRole(ticket.user);
-    ticket.userRole = liveRole;
-    ticket.user = {
-      ...ticket.user,
+  const t = ticket.toObject ? ticket.toObject() : ticket;
+  if (t.user) {
+    const liveRole = resolveLiveUserRole(t.user);
+    t.userRole = liveRole;
+    t.user = {
+      ...t.user,
       role: liveRole,
-      avatar: resolveUrl(ticket.user.avatar),
+      avatar: resolveUrl(t.user.avatar),
     };
+    // Customers never need other people's e-mail; only the staff console does.
+    if (!opts.forStaff) delete t.user.email;
   }
-  return ticket;
+  if (t.assignee?.avatar) t.assignee = { ...t.assignee, avatar: resolveUrl(t.assignee.avatar) };
+  if (t.reportedUser?.avatar) t.reportedUser = { ...t.reportedUser, avatar: resolveUrl(t.reportedUser.avatar) };
+  if (opts.forStaff && opts.viewerId) {
+    // "Unread" is per agent: unread until THIS agent opened the latest message.
+    t.unreadByAdmin = t.unreadByAdmin && !(t.adminReadBy || []).some((a: any) => idOf(a) === opts.viewerId);
+  }
+  if (!opts.forStaff) {
+    delete t.internalNotes;
+    delete t.adminReadBy;
+    delete t.assignee;
+    delete t.priority;
+  }
+  return t;
 };
 
 const resolveMessageUrls = (messages: any[]) => {
-  return messages.map((msg) => {
+  return messages.map((m) => {
+    const msg = m.toObject ? m.toObject() : m;
     if (msg.sender) {
       msg.sender = {
         ...msg.sender,
@@ -49,43 +74,67 @@ const resolveMessageUrls = (messages: any[]) => {
   });
 };
 
+const defaultPriority = (category: TicketCategory): TicketPriority =>
+  category === "safety" ? "urgent" : category === "payment" || category === "job" || category === "kyc" ? "high" : "normal";
+
 // ─── Create Ticket ───────────────────────────────────────
-const createTicket = async (userId: string, subject: string, initialMessage: string) => {
+const createTicket = async (
+  userId: string,
+  input: {
+    subject: string;
+    message: string;
+    category?: TicketCategory;
+    jobId?: string;
+    reportedUserId?: string;
+    attachments?: string[];
+  },
+) => {
   const user = await UserRepository.findById(userId, { populate: "auth" });
   if (!user) {
     throw new AppError(StatusCodes.NOT_FOUND, "User not found");
   }
 
   const userRole = resolveLiveUserRole(user);
+  const category: TicketCategory = input.category || (input.jobId ? "job" : "other");
+
+  // A ticket about a job must come from somebody who is part of that job.
+  if (input.jobId) {
+    const job = await Job.findById(input.jobId).select("postedBy assignedTo").lean();
+    if (!job || (idOf(job.postedBy) !== String(userId) && idOf(job.assignedTo) !== String(userId))) {
+      throw new AppError(StatusCodes.FORBIDDEN, "You can only report problems about your own jobs");
+    }
+  }
+  if (input.reportedUserId && !(await User.exists({ _id: input.reportedUserId }))) {
+    throw new AppError(StatusCodes.NOT_FOUND, "Reported user not found");
+  }
+
+  const attachments = assertOwnUploadKeys(input.attachments, userId, { kinds: ["images", "videos"] });
 
   // Collision-resistant ticket code (unique index will still reject true dups)
-  const ticketId = `TKT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+  const makeCode = () =>
+    `TKT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+  const base = {
+    user: userId as any,
+    userRole,
+    subject: input.subject,
+    status: TicketStatus.OPEN,
+    category,
+    priority: defaultPriority(category),
+    ...(input.jobId ? { job: input.jobId as any } : {}),
+    ...(input.reportedUserId ? { reportedUser: input.reportedUserId as any } : {}),
+    lastMessage: input.message,
+    unreadByAdmin: true,
+    unreadByUser: false,
+    adminReadBy: [],
+  };
 
   let ticket;
   try {
-    ticket = await SupportRepository.createTicket({
-    ticketId,
-    user: userId as any,
-    userRole,
-    subject,
-    status: TicketStatus.OPEN,
-    lastMessage: initialMessage,
-    unreadByAdmin: true,
-    unreadByUser: false,
-    });
+    ticket = await SupportRepository.createTicket({ ticketId: makeCode(), ...base } as any);
   } catch (err: any) {
-    // Retry once on unique ticketId collision
     if (err?.code === 11000) {
-      ticket = await SupportRepository.createTicket({
-        ticketId: `TKT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
-        user: userId as any,
-        userRole,
-        subject,
-        status: TicketStatus.OPEN,
-        lastMessage: initialMessage,
-        unreadByAdmin: true,
-        unreadByUser: false,
-      });
+      ticket = await SupportRepository.createTicket({ ticketId: makeCode(), ...base } as any);
     } else {
       throw err;
     }
@@ -95,11 +144,11 @@ const createTicket = async (userId: string, subject: string, initialMessage: str
     ticket: ticket._id,
     sender: userId,
     senderRole: userRole,
-    content: initialMessage,
+    content: input.message,
+    attachments,
   });
 
-  const subjectPreview =
-    subject.length > 60 ? `${subject.slice(0, 60)}…` : subject;
+  const subjectPreview = input.subject.length > 60 ? `${input.subject.slice(0, 60)}…` : input.subject;
   notifyAdmins(
     "New support ticket",
     `${userRole === "helper" ? "Helper" : "Client"}: ${subjectPreview}`,
@@ -108,7 +157,16 @@ const createTicket = async (userId: string, subject: string, initialMessage: str
       ticketId: String(ticket._id),
       ticketCode: ticket.ticketId || "",
     },
-  ).catch(() => {});
+    "support.manage",
+    "customerServiceTickets",
+  ).catch(() => undefined);
+
+  // Live inbox: staff watching the Support page see it without polling.
+  getSocketServer()?.to("support:admins").emit("support:ticket_created", {
+    ticketId: String(ticket._id),
+    ticketCode: ticket.ticketId,
+    category,
+  });
 
   return ticket;
 };
@@ -116,7 +174,7 @@ const createTicket = async (userId: string, subject: string, initialMessage: str
 // ─── Get User Tickets ────────────────────────────────────
 const getUserTickets = async (userId: string) => {
   const tickets = await SupportRepository.findTicketsByUser(userId);
-  return tickets.map(resolveTicketUrls);
+  return tickets.map((t) => resolveTicketUrls(t));
 };
 
 // ─── Get Ticket Details & Messages ───────────────────────
@@ -126,28 +184,23 @@ const getTicketDetails = async (userId: string, ticketId: string, isAdmin = fals
     throw new AppError(StatusCodes.NOT_FOUND, "Support ticket not found");
   }
 
-  const ownerId = String(
-    typeof ticket.user === "object" && ticket.user !== null && "_id" in ticket.user
-      ? (ticket.user as any)._id
-      : ticket.user,
-  );
+  const ownerId = idOf(ticket.user);
 
   if (!isAdmin && ownerId !== String(userId)) {
     throw new AppError(StatusCodes.FORBIDDEN, "Access denied to this support ticket");
   }
 
-  // Clear unread flags when the ticket is opened
-  if (isAdmin && ticket.unreadByAdmin) {
-    await SupportRepository.updateUnreadFlags(ticketId, { unreadByAdmin: false });
-    ticket.unreadByAdmin = false;
-  } else if (!isAdmin && ticket.unreadByUser) {
-    await SupportRepository.updateUnreadFlags(ticketId, { unreadByUser: false });
+  // Opening the ticket clears the unread marker for the person who opened it.
+  if (isAdmin) {
+    await SupportRepository.markReadByAdmin(ticketId, userId);
+  } else if (ticket.unreadByUser) {
+    await SupportRepository.clearUserUnread(ticketId);
     ticket.unreadByUser = false;
   }
 
   const messages = await SupportRepository.findMessagesByTicket(ticketId);
   return {
-    ticket: resolveTicketUrls(ticket),
+    ticket: resolveTicketUrls(ticket, { forStaff: isAdmin, viewerId: String(userId) }),
     messages: resolveMessageUrls(messages),
   };
 };
@@ -158,7 +211,7 @@ const sendMessage = async (
   ticketId: string,
   content: string,
   attachments: string[] = [],
-  userRole: "user" | "helper" | "admin" = "user"
+  userRole: "user" | "helper" | "admin" = "user",
 ) => {
   const ticket = await SupportRepository.findTicketById(ticketId);
   if (!ticket) {
@@ -166,44 +219,29 @@ const sendMessage = async (
   }
 
   const isFromAdmin = userRole === "admin";
-  const ownerId = String(
-    typeof ticket.user === "object" && ticket.user !== null && "_id" in ticket.user
-      ? (ticket.user as any)._id
-      : ticket.user,
-  );
+  const ownerId = idOf(ticket.user);
 
   // Only ticket owner (or admin/staff) may write
   if (!isFromAdmin && ownerId !== String(userId)) {
     throw new AppError(StatusCodes.FORBIDDEN, "Access denied to this support ticket");
   }
 
-  // Resolved tickets are read-only for the user (admin can still reopen via status)
+  // Resolved tickets are read-only for the user (they can reopen within a week)
   if (!isFromAdmin && ticket.status === TicketStatus.RESOLVED) {
     throw new AppError(
       StatusCodes.BAD_REQUEST,
-      "This ticket is resolved. Create a new ticket for a new issue.",
+      "This ticket is resolved. Reopen it or create a new ticket.",
+      { code: "TICKET_RESOLVED" },
     );
-  }
-
-  // Keep ticket.userRole in sync if owner became a helper later
-  if (!isFromAdmin) {
-    try {
-      const owner = await UserRepository.findById(userId, { populate: "auth" });
-      const liveRole = resolveLiveUserRole(owner);
-      if (liveRole === "helper" && ticket.userRole !== "helper") {
-        const { SupportTicket } = await import("./support.model");
-        await SupportTicket.findByIdAndUpdate(ticketId, { $set: { userRole: liveRole } });
-      }
-    } catch (_) {}
   }
 
   const trimmed = (content || "").trim();
-  const safeAttachments = Array.isArray(attachments) ? attachments : [];
+  const safeAttachments = assertOwnUploadKeys(attachments, userId, {
+    kinds: ["images", "videos"],
+    isStaff: isFromAdmin,
+  });
   if (!trimmed && safeAttachments.length === 0) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Message content or at least one attachment is required",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "Message content or at least one attachment is required");
   }
 
   const message = await SupportRepository.createMessage({
@@ -211,50 +249,39 @@ const sendMessage = async (
     sender: userId,
     senderRole: userRole,
     content: trimmed,
-    attachments: safeAttachments.map(resolveUrl).filter(Boolean),
+    attachments: safeAttachments,
   });
 
   await SupportRepository.updateLastMessage(
     ticketId,
-    trimmed || (safeAttachments.length ? "📎 Attachment" : ""),
+    trimmed || (safeAttachments.length ? "📎" : ""),
     isFromAdmin,
+    isFromAdmin ? userId : undefined,
   );
 
-  // Push notification when support replies to the ticket owner
-  if (isFromAdmin) {
-    const ticketOwnerId =
-      typeof ticket.user === "object" && ticket.user !== null && "_id" in ticket.user
-        ? String((ticket.user as any)._id)
-        : String(ticket.user);
-
-    const previewSrc = trimmed || "📎 Attachment";
-    const preview =
-      previewSrc.length > 80 ? `${previewSrc.slice(0, 80)}…` : previewSrc;
-
-    logger.info("[FCM] support admin reply → notifyUser", {
-      ticketId,
-      ticketOwnerId,
+  // An agent's first reply moves an open ticket to "in progress" and assigns it.
+  if (isFromAdmin && ticket.status === TicketStatus.OPEN) {
+    await SupportRepository.updateFields(ticketId, {
+      status: TicketStatus.IN_PROGRESS,
+      ...(ticket.assignee ? {} : { assignee: userId }),
     });
+  }
 
-    notifyUser(
-      ticketOwnerId,
-      "Support replied",
-      preview || `New message on ticket ${ticket.ticketId || ticketId}`,
+  const previewSrc = trimmed || "📎";
+  const preview = previewSrc.length > 80 ? `${previewSrc.slice(0, 80)}…` : previewSrc;
+
+  if (isFromAdmin) {
+    notifyUserT(
+      ownerId,
+      "support.reply",
+      { preview },
       {
         type: "support_reply",
         ticketId: String(ticket._id || ticketId),
         ticketCode: ticket.ticketId || "",
       },
-    ).catch(() => {});
+    ).catch(() => undefined);
   } else {
-    // User/helper message → alert admin inbox
-    const previewSrc = trimmed || "📎 Attachment";
-    const preview =
-      previewSrc.length > 80 ? `${previewSrc.slice(0, 80)}…` : previewSrc;
-    logger.info("[FCM] support user message → notifyAdmins", {
-      ticketId,
-      userRole,
-    });
     notifyAdmins(
       "Support message",
       `${userRole === "helper" ? "Helper" : "Client"}: ${preview}`,
@@ -263,69 +290,150 @@ const sendMessage = async (
         ticketId: String(ticket._id || ticketId),
         ticketCode: ticket.ticketId || "",
       },
-    ).catch(() => {});
+      "support.manage",
+      "customerServiceTickets",
+    ).catch(() => undefined);
   }
 
   return message;
 };
 
 // ─── Admin: List All Tickets ─────────────────────────────
-const getAllTickets = async (status?: string, userRole?: "user" | "helper", page = 1, limit = 20) => {
+const getAllTickets = async (
+  viewerId: string,
+  q: {
+    status?: string;
+    userRole?: "user" | "helper";
+    category?: string;
+    priority?: string;
+    assignee?: string;
+    search?: string;
+    page?: number;
+    limit?: number;
+  },
+) => {
   const filter: any = {};
-  if (status) filter.status = status;
-  if (userRole) filter.userRole = userRole;
+  if (q.status) filter.status = q.status;
+  if (q.userRole) filter.userRole = q.userRole;
+  if (q.category) filter.category = q.category;
+  if (q.priority) filter.priority = q.priority;
+  if (q.assignee === "me") filter.assignee = viewerId;
+  else if (q.assignee === "none") filter.assignee = { $exists: false };
+  else if (q.assignee && /^[0-9a-fA-F]{24}$/.test(q.assignee)) filter.assignee = q.assignee;
 
-  const result = await SupportRepository.findAllTickets(filter, page, limit);
+  if (q.search) {
+    const re = { $regex: escapeRegex(q.search), $options: "i" };
+    const people = await User.find({ $or: [{ name: re }, { phone: re }] }).select("_id").limit(100).lean();
+    filter.$or = [
+      { subject: re },
+      { ticketId: re },
+      ...(people.length ? [{ user: { $in: people.map((p) => p._id) } }] : []),
+    ];
+  }
+
+  const result = await SupportRepository.findAllTickets(filter, q.page || 1, Math.min(q.limit || 20, 100));
   return {
     ...result,
-    docs: result.docs.map(resolveTicketUrls),
+    docs: result.docs.map((t) => resolveTicketUrls(t, { forStaff: true, viewerId })),
   };
 };
 
 // ─── Admin: Update Ticket Status ─────────────────────────
+const statusTemplate: Record<string, string> = {
+  resolved: "support.status_resolved",
+  in_progress: "support.status_in_progress",
+  open: "support.status_open",
+};
+
 const updateTicketStatus = async (ticketId: string, status: TicketStatus) => {
   const ticket = await SupportRepository.updateTicketStatus(ticketId, status);
   if (!ticket) {
     throw new AppError(StatusCodes.NOT_FOUND, "Support ticket not found");
   }
 
-  const ownerId = String(
-    typeof ticket.user === "object" && ticket.user !== null && "_id" in ticket.user
-      ? (ticket.user as any)._id
-      : ticket.user,
-  );
-
-  const statusLabel =
-    status === TicketStatus.RESOLVED
-      ? "resolved"
-      : status === TicketStatus.IN_PROGRESS
-        ? "in progress"
-        : "open";
-
-  notifyUser(
+  const ownerId = idOf(ticket.user);
+  notifyUserT(
     ownerId,
-    "Support ticket updated",
-    `Ticket ${ticket.ticketId || ticketId} is now ${statusLabel}.`,
+    statusTemplate[status] || "support.status_open",
+    { code: ticket.ticketId || ticketId },
     {
       type: "support_reply",
       ticketId: String(ticket._id || ticketId),
       ticketCode: ticket.ticketId || "",
       status,
     },
-  ).catch(() => {});
+  ).catch(() => undefined);
+  emitToUser(ownerId, "support:status", { ticketId: String(ticket._id), status });
 
   return ticket;
+};
+
+/** Admin: priority / category / assignee. */
+const updateTicketMeta = async (
+  ticketId: string,
+  fields: { priority?: TicketPriority; category?: TicketCategory; assignee?: string | null },
+) => {
+  const set: Record<string, unknown> = {};
+  if (fields.priority) set.priority = fields.priority;
+  if (fields.category) set.category = fields.category;
+  if (fields.assignee !== undefined) {
+    if (fields.assignee) {
+      const ok = await UserRepository.exists({ _id: fields.assignee });
+      if (!ok) throw new AppError(StatusCodes.NOT_FOUND, "Assignee not found");
+      set.assignee = fields.assignee;
+    } else {
+      await SupportTicket.updateOne({ _id: ticketId }, { $unset: { assignee: 1 } });
+    }
+  }
+  const ticket = Object.keys(set).length
+    ? await SupportRepository.updateFields(ticketId, set)
+    : await SupportRepository.findTicketById(ticketId);
+  if (!ticket) throw new AppError(StatusCodes.NOT_FOUND, "Support ticket not found");
+  return ticket;
+};
+
+/** Admin: private remark on a ticket. */
+const addInternalNote = async (ticketId: string, adminId: string, text: string) => {
+  const admin = await UserRepository.findById(adminId, { select: "name" });
+  const ticket = await SupportRepository.addNote(ticketId, { by: adminId, byName: admin?.name, text });
+  if (!ticket) throw new AppError(StatusCodes.NOT_FOUND, "Support ticket not found");
+  return ticket.internalNotes;
+};
+
+/** Customer: reopen a resolved ticket (within a week). */
+const reopenTicket = async (userId: string, ticketId: string) => {
+  const ticket = await SupportRepository.findTicketById(ticketId);
+  if (!ticket) throw new AppError(StatusCodes.NOT_FOUND, "Support ticket not found");
+  if (idOf(ticket.user) !== String(userId)) {
+    throw new AppError(StatusCodes.FORBIDDEN, "Access denied to this support ticket");
+  }
+  if (ticket.status !== TicketStatus.RESOLVED) {
+    throw new AppError(StatusCodes.BAD_REQUEST, "This ticket is not resolved");
+  }
+  if (
+    ticket.resolvedAt &&
+    Date.now() - new Date(ticket.resolvedAt).getTime() > REOPEN_WINDOW_DAYS * 86_400_000
+  ) {
+    throw new AppError(StatusCodes.BAD_REQUEST, "This ticket is too old to reopen. Please create a new one.", {
+      code: "REOPEN_WINDOW_PASSED",
+    });
+  }
+  const updated = await SupportRepository.updateTicketStatus(ticketId, TicketStatus.OPEN);
+  await SupportRepository.updateFields(ticketId, { unreadByAdmin: true, adminReadBy: [] });
+  notifyAdmins(
+    "Ticket reopened",
+    `${ticket.ticketId || ticketId} was reopened by the customer`,
+    { type: "support_reply", ticketId: String(ticket._id), ticketCode: ticket.ticketId || "" },
+    "support.manage",
+  ).catch(() => undefined);
+  return updated;
 };
 
 /** Lightweight helper for socket emit — returns owner user id string. */
 const getTicketOwnerForEmit = async (ticketId: string): Promise<string | null> => {
   const ticket = await SupportRepository.findTicketById(ticketId);
   if (!ticket?.user) return null;
-  return String(
-    typeof ticket.user === "object" && "_id" in ticket.user
-      ? (ticket.user as any)._id
-      : ticket.user,
-  );
+  return idOf(ticket.user);
 };
 
 export const SupportService = {
@@ -335,5 +443,8 @@ export const SupportService = {
   sendMessage,
   getAllTickets,
   updateTicketStatus,
+  updateTicketMeta,
+  addInternalNote,
+  reopenTicket,
   getTicketOwnerForEmit,
 };

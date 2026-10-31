@@ -24,6 +24,8 @@ const notificationSchema = new Schema<TAppNotification>(
 notificationSchema.index({ user: 1, createdAt: -1 });
 notificationSchema.index({ user: 1, read: 1 });
 notificationSchema.index({ audience: 1, createdAt: -1 });
+// History is kept for 60 days, then removed automatically.
+notificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 60 * 24 * 60 * 60 });
 
 export const AppNotification = model<TAppNotification>(
   "AppNotification",

@@ -4,9 +4,15 @@ import sendResponse from "@shared/sendResponse";
 import { StatusCodes } from "http-status-codes";
 import { GeocodingService } from "./geocoding.service";
 
+const langOf = (req: Request): string | undefined => {
+  const q = typeof req.query.lang === "string" ? req.query.lang : "";
+  const h = String(req.headers["accept-language"] || "").split(",")[0];
+  return (q || h || "").slice(0, 2).toLowerCase() || undefined;
+};
+
 const reverseGeocode = catchAsync(async (req: Request, res: Response) => {
   const { lat, lon } = req.query as { lat: string; lon: string };
-  const result = await GeocodingService.reverseGeocode(Number(lat), Number(lon));
+  const result = await GeocodingService.reverseGeocode(Number(lat), Number(lon), langOf(req));
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -17,8 +23,12 @@ const reverseGeocode = catchAsync(async (req: Request, res: Response) => {
 });
 
 const forwardGeocode = catchAsync(async (req: Request, res: Response) => {
-  const { q, limit } = req.query as { q: string; limit?: string };
-  const result = await GeocodingService.forwardGeocode(q, Number(limit) || 5);
+  const { q, limit, lat, lon } = req.query as { q: string; limit?: string; lat?: string; lon?: string };
+  const result = await GeocodingService.forwardGeocode(q, Number(limit) || 5, {
+    lang: langOf(req),
+    lat: lat !== undefined ? Number(lat) : undefined,
+    lon: lon !== undefined ? Number(lon) : undefined,
+  });
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,

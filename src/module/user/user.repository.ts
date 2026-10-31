@@ -69,19 +69,36 @@ export const UserRepository = {
   },
 
   /** Prevents the same FCM token from remaining on another account (shared device / account switch). */
-  clearDeviceTokenFromOthers(userId: string, token: string) {
-    return User.updateMany(
+  async clearDeviceTokenFromOthers(userId: string, token: string) {
+    await User.updateMany(
       { deviceToken: token, _id: { $ne: userId } },
       { $unset: { deviceToken: 1, deviceTokenPlatform: 1, deviceTokenUpdatedAt: 1 } },
+    );
+    return User.updateMany(
+      { "deviceTokens.token": token, _id: { $ne: userId } },
+      { $pull: { deviceTokens: { token } } },
     );
   },
 
   /** Remove a dead/expired FCM token wherever it is stored. */
-  clearDeviceTokenByValue(token: string) {
-    return User.updateMany(
+  async clearDeviceTokenByValue(token: string) {
+    await User.updateMany(
       { deviceToken: token },
       { $unset: { deviceToken: 1, deviceTokenPlatform: 1, deviceTokenUpdatedAt: 1 } },
     );
+    return User.updateMany(
+      { "deviceTokens.token": token },
+      { $pull: { deviceTokens: { token } } },
+    );
+  },
+
+  /** All push tokens of a user (multi-device list + the legacy single token). */
+  tokensOf(user: { deviceToken?: string | null; deviceTokens?: { token: string }[] } | null): string[] {
+    if (!user) return [];
+    const set = new Set<string>();
+    for (const d of user.deviceTokens || []) if (d?.token) set.add(d.token);
+    if (user.deviceToken) set.add(user.deviceToken);
+    return [...set];
   },
 
   deleteById(id: string) {

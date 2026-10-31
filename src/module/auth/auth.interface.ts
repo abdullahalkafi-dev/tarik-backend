@@ -35,6 +35,9 @@ export interface TAuth {
   blacklistedReason?: string;
   blacklistedAt?: Date;
   isDeleted: boolean;
+  mustChangePassword?: boolean;
+  /** Bumped to invalidate every access token issued before (password reset, ban, role change…). */
+  tokenVersion: number;
   googleId?: string;
   lastLogin?: Date;
   createdAt: Date;

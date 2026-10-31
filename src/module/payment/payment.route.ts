@@ -1,5 +1,5 @@
 import { Router } from "express";
-import auth from "@middlewares/auth";
+import auth, { requirePermission } from "@middlewares/auth";
 import validateRequest from "@middlewares/validateRequest";
 import { PaymentController } from "./payment.controller";
 import { PaymentDto } from "./payment.dto";
@@ -37,20 +37,35 @@ router.get("/callback", PaymentController.handleCallback);
  * @desc    List all payment transactions (Admin)
  * @access  Private (Admin)
  */
-router.get("/", auth("superAdmin", "admin", "staff"), PaymentController.getAllPayments);
+router.get(
+  "/",
+  auth("superAdmin", "admin", "staff"),
+  requirePermission("payments.view"),
+  PaymentController.getAllPayments,
+);
 
 /**
  * @route   GET /api/v1/payment/stuck
  * @desc    Aging pending (>24h) + failed payments (Admin)
  * @access  Private (Admin)
  */
-router.get("/stuck", auth("superAdmin", "admin", "staff"), PaymentController.getStuckPayments);
+router.get(
+  "/stuck",
+  auth("superAdmin", "admin", "staff"),
+  requirePermission("payments.view"),
+  PaymentController.getStuckPayments,
+);
 
 /**
  * @route   GET /api/v1/payment/:id
  * @desc    Get payment transaction details (Admin)
  * @access  Private (Admin)
  */
-router.get("/:id", auth("superAdmin", "admin", "staff"), PaymentController.getPaymentById);
+router.get(
+  "/:id",
+  auth("superAdmin", "admin", "staff"),
+  requirePermission("payments.view"),
+  PaymentController.getPaymentById,
+);
 
 export const PaymentRoutes = router;

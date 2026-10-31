@@ -50,6 +50,13 @@ const offerDataSchema = new Schema(
       type: Number,
       default: 0,
     },
+    version: { type: Number, default: 1 },
+    totalAmount: { type: Number },
+    hourlyRate: { type: Number },
+    hours: { type: Number },
+    feePercentage: { type: Number },
+    helperNet: { type: Number },
+    expiresAt: { type: Date },
   },
   { _id: false },
 );
@@ -87,6 +94,7 @@ const messageSchema = new Schema<TMessage>(
     images: [{ type: String }],
     video: { type: String },
     offerData: { type: offerDataSchema },
+    masked: { type: Boolean, default: false },
     readBy: [readBySchema],
   },
   { timestamps: true },
@@ -96,5 +104,7 @@ const messageSchema = new Schema<TMessage>(
 messageSchema.index({ conversation: 1, createdAt: -1 });
 // Index: find unread messages for a user in a conversation
 messageSchema.index({ conversation: 1, "readBy.userId": 1 });
+// Offer maintenance (expiry, stuck payments) scans only offers.
+messageSchema.index({ type: 1, "offerData.status": 1, "offerData.expiresAt": 1 });
 
 export const Message = model<TMessage>("Message", messageSchema);

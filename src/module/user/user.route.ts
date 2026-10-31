@@ -3,6 +3,7 @@ import auth from "@middlewares/auth";
 import validateRequest from "@middlewares/validateRequest";
 import { UserController } from "./user.controller";
 import { UserDto } from "./user.dto";
+import { authLimiter } from "@middlewares/security";
 
 const router = Router();
 
@@ -77,7 +78,12 @@ router.post(
  * @desc    Search approved helpers (nearby, by category)
  * @access  Private
  */
-router.get("/helpers/search", auth(), UserController.searchHelpers);
+router.get(
+  "/helpers/search",
+  auth(),
+  validateRequest(UserDto.searchHelpers),
+  UserController.searchHelpers,
+);
 
 /**
  * @route   GET /api/v1/user/helpers/:id
@@ -106,7 +112,45 @@ router.post(
 router.delete(
   "/device-token",
   auth(),
+  validateRequest(UserDto.clearDeviceToken),
   UserController.clearDeviceToken,
+);
+
+/**
+ * @route   PATCH /api/v1/user/availability
+ * @desc    Helper "on duty / off duty" switch
+ * @access  Private (approved helper)
+ */
+router.patch(
+  "/availability",
+  auth(),
+  validateRequest(UserDto.availability),
+  UserController.setAvailability,
+);
+
+/**
+ * @route   POST /api/v1/user/accept-legal
+ * @desc    Record acceptance of the current Terms / Privacy version
+ * @access  Private
+ */
+router.post(
+  "/accept-legal",
+  auth(),
+  validateRequest(UserDto.acceptLegal),
+  UserController.acceptLegal,
+);
+
+/**
+ * @route   DELETE /api/v1/user/me
+ * @desc    Delete (anonymise) own account — requires the password
+ * @access  Private
+ */
+router.delete(
+  "/me",
+  authLimiter,
+  auth(),
+  validateRequest(UserDto.deleteAccount),
+  UserController.deleteAccount,
 );
 
 export const UserRoutes = router;

@@ -218,6 +218,19 @@ const handleWebhook = async (
     return { success: true, message: "Webhook already processed" };
   }
 
+  // Admin alert (Settings → "Successful payments")
+  import("../../util/notifyAdmins")
+    .then(({ notifyAdmins }) =>
+      notifyAdmins(
+        "Payment received",
+        `${amount} MAD (${orderType})`,
+        { type: "payment_received", orderId: String(orderId || "") },
+        "payments.view",
+        "successfulPayments",
+      ),
+    )
+    .catch(() => undefined);
+
   // Fulfill business logic based on orderType
   if (orderType === OrderType.WALLET_TOPUP) {
     const userId = metadata?.userId;
@@ -487,9 +500,15 @@ const getAllPayments = async (query: {
     filter.paymentMethod = query.paymentMethod;
   }
   if (query.search) {
+    // Escaped: the text is searched literally, it is not a pattern.
+    const re = { $regex: query.search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" };
+    // Transaction / order reference, or the payer's name or phone.
+    const { User } = await import("../user/user.model");
+    const payers = await User.find({ $or: [{ name: re }, { phone: re }] }).select("_id").limit(100).lean();
     filter.$or = [
-      { transactionId: { $regex: query.search, $options: "i" } },
-      { orderId: { $regex: query.search, $options: "i" } },
+      { transactionId: re },
+      { orderId: re },
+      ...(payers.length ? [{ user: { $in: payers.map((p) => p._id) } }] : []),
     ];
   }
 

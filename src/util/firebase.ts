@@ -41,6 +41,30 @@ const sanitizeData = (data?: Record<string, unknown>): Record<string, string> =>
   return out;
 };
 
+export type FcmSendOptions = {
+  /** How long FCM/APNs may keep the message for a phone that is currently unreachable. */
+  ttlSeconds?: number;
+  collapseKey?: string;
+};
+
+/** Chat is relevant for hours, a "new job nearby" is stale after minutes. */
+export const ttlForType = (type?: string): number => {
+  switch (type) {
+    case "chat_message":
+    case "chat_offer":
+      return 2 * 60 * 60;
+    case "new_job":
+      return 30 * 60;
+    default:
+      return 60 * 60;
+  }
+};
+
+const apnsHeaders = (ttlSeconds: number) => ({
+  "apns-priority": "10",
+  "apns-expiration": String(Math.floor(Date.now() / 1000) + ttlSeconds),
+});
+
 export type FcmSendResult = {
   success: boolean;
   /** Present when the token is permanently invalid and should be cleared. */
@@ -52,6 +76,7 @@ export const sendFCMNotification = async (
   title: string,
   body: string,
   data?: Record<string, unknown>,
+  options: FcmSendOptions = {},
 ): Promise<FcmSendResult> => {
   const firebaseApp = getApp();
   if (!firebaseApp) {
@@ -62,7 +87,9 @@ export const sendFCMNotification = async (
   }
 
   const collapseKey =
-    String(data?.type || data?.jobId || data?.conversationId || "tarik");
+    options.collapseKey ||
+    String(data?.conversationId || data?.jobId || data?.type || "tarik");
+  const ttlSeconds = options.ttlSeconds ?? ttlForType(String(data?.type || ""));
 
   try {
     await admin.messaging(firebaseApp).send({
@@ -73,8 +100,9 @@ export const sendFCMNotification = async (
         // Collapse same-event pushes so retries don't queue behind old ones.
         collapseKey,
         priority: "high",
-        // Expire quickly so FCM does not store-and-forward stale pushes.
-        ttl: 0,
+        // Keep the push for a phone that is briefly unreachable (tunnel, doze,
+        // weak signal) instead of dropping it ("ttl: 0" = deliver now or never).
+        ttl: ttlSeconds * 1000,
         notification: {
           sound: "default",
           channelId: FCM_ANDROID_CHANNEL_ID,
@@ -82,7 +110,7 @@ export const sendFCMNotification = async (
         },
       },
       apns: {
-        headers: { "apns-priority": "10" },
+        headers: apnsHeaders(ttlSeconds),
         payload: { aps: { sound: "default", badge: 1, "content-available": 1 } },
       },
     });
@@ -113,6 +141,7 @@ export const sendFCMMulticast = async (
   title: string,
   body: string,
   data?: Record<string, unknown>,
+  options: FcmSendOptions = {},
 ): Promise<{ invalidTokens: string[] }> => {
   const invalidTokens: string[] = [];
   if (!deviceTokens.length) return { invalidTokens };
@@ -120,7 +149,8 @@ export const sendFCMMulticast = async (
   const firebaseApp = getApp();
   if (!firebaseApp) return { invalidTokens };
 
-  const collapseKey = String(data?.type || data?.jobId || "tarik");
+  const collapseKey = options.collapseKey || String(data?.jobId || data?.type || "tarik");
+  const ttlSeconds = options.ttlSeconds ?? ttlForType(String(data?.type || ""));
 
   const CHUNK_SIZE = 500;
   const chunks: string[][] = [];
@@ -138,7 +168,7 @@ export const sendFCMMulticast = async (
           android: {
             collapseKey,
             priority: "high",
-            ttl: 0,
+            ttl: ttlSeconds * 1000,
             notification: {
               sound: "default",
               channelId: FCM_ANDROID_CHANNEL_ID,
@@ -146,7 +176,7 @@ export const sendFCMMulticast = async (
             },
           },
           apns: {
-            headers: { "apns-priority": "10" },
+            headers: apnsHeaders(ttlSeconds),
             payload: { aps: { sound: "default", badge: 1, "content-available": 1 } },
           },
         }),

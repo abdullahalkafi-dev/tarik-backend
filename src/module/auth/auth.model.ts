@@ -5,7 +5,7 @@ import config from "config";
 
 const authSchema = new Schema<any>(
   {
-    email: { type: String, sparse: true },
+    email: { type: String, lowercase: true, trim: true },
     phone: {
       type: String,
       unique: true,
@@ -31,17 +31,30 @@ const authSchema = new Schema<any>(
       default: AuthStatus.PENDING,
     },
     isSuperAdmin: { type: Boolean, default: false },
-    permissions: { type: [String], default: ["*"] },
+    // Only staff/admin accounts carry permissions; everybody else has none.
+    permissions: { type: [String], default: [] },
     isEmailVerified: { type: Boolean, default: false },
     isPhoneVerified: { type: Boolean, default: false },
     isBlacklisted: { type: Boolean, default: false },
     blacklistedReason: { type: String },
     blacklistedAt: { type: Date },
     isDeleted: { type: Boolean, default: false },
+    /** Staff created by an admin must choose their own password at first login. */
+    mustChangePassword: { type: Boolean, default: false },
+    tokenVersion: { type: Number, default: 0 },
     googleId: { type: String },
     lastLogin: { type: Date },
   },
   { timestamps: true },
+);
+
+// One live account per e-mail address (soft-deleted accounts free the address).
+authSchema.index(
+  { email: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { email: { $type: "string" }, isDeleted: false },
+  },
 );
 
 // Hash password before saving

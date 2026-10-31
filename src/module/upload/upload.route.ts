@@ -1,115 +1,79 @@
+import fs from "fs";
+import os from "os";
+import path from "path";
+import crypto from "crypto";
 import { Router } from "express";
 import multer from "multer";
 import auth from "@middlewares/auth";
+import { uploadLimiter } from "@middlewares/security";
 import { UploadController } from "./upload.controller";
 
 const router = Router();
 
-// Multer memory storage for buffer-based uploads
-const memoryStorage = multer.memoryStorage();
+// Uploads are written to a temp file (never held in RAM) and removed after
+// processing. The real file type is checked from the bytes, not the client header.
+const TMP_DIR = path.join(os.tmpdir(), "tarik-uploads");
+fs.mkdirSync(TMP_DIR, { recursive: true });
+
+const diskStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, TMP_DIR),
+  filename: (_req, _file, cb) => cb(null, crypto.randomUUID()),
+});
 
 const imageUpload = multer({
-  storage: memoryStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-  fileFilter: (_req, file, cb) => {
-    const allowedMimes = ["image/jpeg", "image/png", "image/jpg", "image/webp", "image/svg+xml"];
-    if (allowedMimes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error("Only JPEG, PNG, JPG, WebP, and SVG images are allowed"));
-    }
-  },
+  storage: diskStorage,
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 }, // 10 MB
 });
 
 const documentUpload = multer({
-  storage: memoryStorage,
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
-  fileFilter: (_req, file, cb) => {
-    const allowedMimes = ["image/jpeg", "image/png", "image/jpg", "image/webp", "application/pdf"];
-    if (allowedMimes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error("Only JPEG, PNG, JPG, WebP, and PDF files are allowed"));
-    }
-  },
+  storage: diskStorage,
+  limits: { fileSize: 15 * 1024 * 1024, files: 1 }, // 15 MB
 });
 
 const videoUpload = multer({
-  storage: memoryStorage,
-  limits: { fileSize: 400 * 1024 * 1024 }, // 400MB
-  fileFilter: (_req, file, cb) => {
-    const allowedMimes = [
-      "video/mp4",
-      "video/quicktime",
-      "video/x-msvideo",
-      "video/x-ms-wmv",
-      "video/webm",
-      "video/3gpp",
-      "video/x-matroska",
-    ];
-    if (allowedMimes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error("Only MP4, MOV, AVI, WMV, WebM, 3GP, MKV videos are allowed"));
-    }
-  },
+  storage: diskStorage,
+  limits: { fileSize: 50 * 1024 * 1024, files: 1 }, // 50 MB (the app compresses before upload)
 });
 
 /**
  * @route   POST /api/v1/upload/image
- * @desc    Upload profile/cover photo (compressed to WebP 75%)
+ * @desc    Upload profile/job/chat photo (re-encoded to WebP)
  * @access  Private
  */
-router.post(
-  "/image",
-  auth(),
-  imageUpload.single("file"),
-  UploadController.uploadImage,
-);
+router.post("/image", auth(), uploadLimiter, imageUpload.single("file"), UploadController.uploadImage);
 
 /**
  * @route   POST /api/v1/upload/video
- * @desc    Upload video for chat messages (raw, no compression)
+ * @desc    Upload a video for chat / support (max 50 MB)
  * @access  Private
  */
-router.post(
-  "/video",
-  auth(),
-  videoUpload.single("file"),
-  UploadController.uploadVideo,
-);
+router.post("/video", auth(), uploadLimiter, videoUpload.single("file"), UploadController.uploadVideo);
 
 /**
  * @route   POST /api/v1/upload/document
- * @desc    Upload ID/certificate document (WebP, no quality loss)
+ * @desc    Upload an ID / selfie photo (private storage, signed links only)
  * @access  Private
  */
 router.post(
   "/document",
   auth(),
+  uploadLimiter,
   documentUpload.single("file"),
   UploadController.uploadDocument,
 );
 
 /**
  * @route   GET /api/v1/upload/files/*key
- * @desc    Stream uploaded file from MinIO storage (public access with cache)
- * @access  Public
+ * @desc    Stream an uploaded file (Range supported). Private files need a signed link.
+ * @access  Public (signed for private files)
  */
-router.get(
-  "/files/*key",
-  UploadController.getFile,
-);
+router.get("/files/*key", UploadController.getFile);
 
 /**
  * @route   DELETE /api/v1/upload/*key
- * @desc    Delete uploaded file
+ * @desc    Delete one of your own files that nothing references any more
  * @access  Private
  */
-router.delete(
-  "/*key",
-  auth(),
-  UploadController.deleteFile,
-);
+router.delete("/*key", auth(), UploadController.deleteFile);
 
 export const UploadRoutes = router;

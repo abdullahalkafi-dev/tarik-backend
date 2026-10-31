@@ -2,15 +2,15 @@ import { createClient, RedisClientType } from "./redisPackage";
 import config from "../config";
 import { logger } from "../logger/logger";
 
+/** How long boot waits for the first Redis connection before continuing without it. */
+const INITIAL_CONNECT_WAIT_MS = 5000;
+
 class RedisClient {
   private clientInstance: RedisClientType;
   private isConnected = false;
   private connectionPromise: Promise<void> | null = null;
-  private retryCount = 0;
-  private maxRetries = 3;
-  private retryDelay = 1000;
   private lastError: string | null = null;
-  private hasGivenUpOnRedis = false;
+  private lastLoggedErrorAt = 0;
 
   constructor() {
     this.clientInstance = createClient({
@@ -19,18 +19,9 @@ class RedisClient {
       socket: {
         connectTimeout: 5000,
         noDelay: true,
-        reconnectStrategy: (retries: number) => {
-          if (this.hasGivenUpOnRedis) return false;
-
-          this.retryCount = retries;
-
-          if (this.retryCount >= this.maxRetries) {
-            this.hasGivenUpOnRedis = true;
-            return false;
-          }
-
-          return Math.min(Math.pow(2, this.retryCount) * this.retryDelay, 5000);
-        },
+        // Never give up: a short Redis restart must not need an API restart.
+        // Back-off grows from 0.5 s up to a 10 s ceiling.
+        reconnectStrategy: (retries: number) => Math.min(500 * Math.pow(2, Math.min(retries, 5)), 10000),
       },
     });
 
@@ -39,17 +30,17 @@ class RedisClient {
 
   private setupEventHandlers(): void {
     this.clientInstance.on("error", (err: Error) => {
-      if (!this.hasGivenUpOnRedis) {
-        logger.warn(`Redis client error: ${err.message}`);
-      }
       this.isConnected = false;
       this.lastError = err.message;
+      // Avoid flooding the log while Redis is down (one line per 30 s).
+      const now = Date.now();
+      if (now - this.lastLoggedErrorAt > 30000) {
+        this.lastLoggedErrorAt = now;
+        logger.warn(`Redis client error: ${err.message}`);
+      }
     });
 
     this.clientInstance.on("connect", () => {
-      this.isConnected = true;
-      this.retryCount = 0;
-      this.hasGivenUpOnRedis = false;
       this.lastError = null;
     });
 
@@ -59,7 +50,7 @@ class RedisClient {
       this.lastError = null;
     });
 
-    this.clientInstance.on("disconnect", () => {
+    this.clientInstance.on("end", () => {
       this.isConnected = false;
     });
   }
@@ -76,12 +67,16 @@ class RedisClient {
     return this.lastError;
   }
 
+  /**
+   * Start the connection. Resolves as soon as Redis is ready OR after a short
+   * wait, whichever is first; if Redis is still down the client keeps retrying
+   * in the background and the API starts in "degraded" mode.
+   */
   async connect(): Promise<void> {
     if (this.isConnected) return;
     if (this.connectionPromise) return this.connectionPromise;
 
     this.connectionPromise = this.attemptConnection();
-
     try {
       await this.connectionPromise;
     } finally {
@@ -90,20 +85,28 @@ class RedisClient {
   }
 
   private async attemptConnection(): Promise<void> {
-    try {
-      await this.clientInstance.connect();
-      logger.info("Connected to Redis");
-      this.lastError = null;
-    } catch (error) {
-      this.isConnected = false;
+    if (this.clientInstance.isOpen) return;
+
+    const connecting = this.clientInstance.connect().then(() => undefined);
+    // The pending connect() keeps retrying forever; swallow its rejection so a
+    // late failure is never an unhandled rejection.
+    connecting.catch((error) => {
       this.lastError = error instanceof Error ? error.message : String(error);
-      throw error;
+    });
+
+    await Promise.race([
+      connecting,
+      new Promise<void>((resolve) => setTimeout(resolve, INITIAL_CONNECT_WAIT_MS)),
+    ]);
+
+    if (!this.isAvailable()) {
+      logger.warn("Redis not reachable yet — continuing in degraded mode, retrying in background");
     }
   }
 
   async ensureConnected(): Promise<void> {
     if (!config.cache.enabled) throw new Error("Redis cache is disabled");
-    if (!this.isConnected) await this.connect();
+    if (!this.isAvailable()) throw new Error("Redis unavailable");
   }
 
   async disconnect(): Promise<void> {
@@ -116,8 +119,7 @@ class RedisClient {
   async healthCheck(): Promise<boolean> {
     try {
       if (!config.cache.enabled) return true;
-      if (!this.clientInstance.isOpen) return false;
-      await this.ensureConnected();
+      if (!this.clientInstance.isOpen || !this.isAvailable()) return false;
       await this.clientInstance.ping();
       return true;
     } catch (error) {
@@ -127,18 +129,14 @@ class RedisClient {
   }
 
   async set(key: string, value: string, expiryInSec = 3600): Promise<void> {
-    if (this.hasGivenUpOnRedis || !this.isAvailable()) {
-      throw new Error("Redis unavailable");
-    }
-    if (!this.isConnected) await this.ensureConnected();
+    if (!this.isAvailable()) throw new Error("Redis unavailable");
     await this.clientInstance.setEx(key, expiryInSec, value);
   }
 
   async setNX(key: string, value: string, expiryInSec = 86400): Promise<boolean> {
-    if (this.hasGivenUpOnRedis || !this.isAvailable()) {
+    if (!this.isAvailable()) {
       return true; // fail-open if redis is unavailable
     }
-    if (!this.isConnected) await this.ensureConnected();
     const result = await this.clientInstance.set(key, value, {
       EX: expiryInSec,
       NX: true,
@@ -147,27 +145,28 @@ class RedisClient {
   }
 
   async get(key: string): Promise<string | null> {
-    if (this.hasGivenUpOnRedis || !this.isAvailable()) {
-      throw new Error("Redis unavailable");
-    }
-    if (!this.isConnected) await this.ensureConnected();
+    if (!this.isAvailable()) throw new Error("Redis unavailable");
     return this.clientInstance.get(key);
   }
 
   async delete(key: string): Promise<void> {
-    if (this.hasGivenUpOnRedis || !this.isAvailable()) {
-      throw new Error("Redis unavailable");
-    }
-    if (!this.isConnected) await this.ensureConnected();
+    if (!this.isAvailable()) throw new Error("Redis unavailable");
     await this.clientInstance.del(key);
   }
 
   async keys(pattern: string): Promise<string[]> {
-    if (this.hasGivenUpOnRedis || !this.isAvailable()) {
-      throw new Error("Redis unavailable");
-    }
-    if (!this.isConnected) await this.ensureConnected();
+    if (!this.isAvailable()) throw new Error("Redis unavailable");
     return this.clientInstance.keys(pattern);
+  }
+
+  /**
+   * Atomic "count in a fixed window": returns the new counter value and makes
+   * sure the key always carries a TTL (the first hit creates it).
+   */
+  async incrWithWindow(key: string, windowSeconds: number): Promise<number> {
+    if (!this.isAvailable()) throw new Error("Redis unavailable");
+    await this.clientInstance.set(key, "0", { EX: windowSeconds, NX: true });
+    return this.clientInstance.incr(key);
   }
 }
 

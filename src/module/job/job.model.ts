@@ -13,7 +13,11 @@ const jobSchema = new Schema<TJob>(
     date: { type: Date },
     startTime: { type: String, trim: true },
     endTime: { type: String, trim: true },
-    budget: { type: Number, required: true, min: 0 },
+    startAt: { type: Date },
+    endAt: { type: Date },
+    budget: { type: Number, required: true, min: 0, max: 1_000_000 },
+    hourlyRate: { type: Number, min: 0 },
+    hours: { type: Number, min: 0 },
     budgetType: {
       type: String,
       enum: Object.values(BudgetType),
@@ -55,7 +59,19 @@ const jobSchema = new Schema<TJob>(
       required: true,
     },
     commissionDeducted: { type: Number, default: 0 },
+    feePercentage: { type: Number, min: 0, max: 100 },
+    helperNet: { type: Number, min: 0 },
+    acceptedAt: { type: Date },
+    onTheWayAt: { type: Date },
+    arrivedAt: { type: Date },
+    helperFinishedAt: { type: Date },
+    autoCompleteAt: { type: Date },
+    disputeOpen: { type: Boolean, default: false },
+    reminderSentAt: { type: Date },
+    notifiedHelpers: { type: [Schema.Types.ObjectId], select: false, default: undefined },
     cancellationReason: { type: String, trim: true },
+    cancellationCode: { type: String, trim: true, maxlength: 60 },
+    cancelledByRole: { type: String, enum: ["client", "helper", "admin", "system"] },
     cancelledBy: {
       type: Schema.Types.ObjectId,
       ref: "User",
@@ -79,7 +95,21 @@ const jobSchema = new Schema<TJob>(
       {
         action: {
           type: String,
-          enum: ["created", "accepted", "completed", "cancelled", "payment_open", "refunded"],
+          enum: [
+            "created",
+            "accepted",
+            "on_the_way",
+            "arrived",
+            "finished",
+            "completed",
+            "auto_completed",
+            "cash_confirmed",
+            "cancelled",
+            "edited",
+            "dispute",
+            "payment_open",
+            "refunded",
+          ],
           required: true,
         },
         by: { type: Schema.Types.ObjectId, ref: "User" },
@@ -101,5 +131,9 @@ jobSchema.index({ category: 1 });
 jobSchema.index({ status: 1 });
 jobSchema.index({ status: 1, cancelledAt: -1 });
 jobSchema.index({ status: 1, createdAt: 1 });
+jobSchema.index({ status: 1, startAt: 1 });
+jobSchema.index({ postedBy: 1, status: 1, createdAt: -1 });
+jobSchema.index({ assignedTo: 1, status: 1, createdAt: -1 });
+jobSchema.index({ status: 1, autoCompleteAt: 1 });
 
 export const Job = model<TJob>("Job", jobSchema);

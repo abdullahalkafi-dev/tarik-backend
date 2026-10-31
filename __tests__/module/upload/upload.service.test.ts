@@ -1,130 +1,114 @@
+import fs from "fs";
+import os from "os";
+import path from "path";
+import sharp from "sharp";
 import mongoose from "mongoose";
-import { UploadService } from "module/upload/upload.service";
-import AppError from "errors/AppError";
 
-jest.mock("util/minio", () => ({
-  uploadToMinio: jest.fn(),
-  deleteFromMinio: jest.fn(),
+jest.mock("../../../src/util/minio", () => ({
+  uploadToMinio: jest.fn().mockResolvedValue("ok"),
+  uploadFileToMinio: jest.fn().mockResolvedValue("ok"),
+  deleteFromMinio: jest.fn().mockResolvedValue(undefined),
   resolveUrl: jest.fn((key: string) => `http://localhost:5000/api/v1/upload/files/${key}`),
 }));
 
-jest.mock("util/imageProcessor", () => ({
-  processImage: jest.fn(),
-}));
+import { UploadService } from "../../../src/module/upload/upload.service";
+import { Job } from "../../../src/module/job/job.model";
+import { uploadToMinio, uploadFileToMinio, deleteFromMinio } from "../../../src/util/minio";
 
-const { uploadToMinio, deleteFromMinio, resolveUrl } = require("util/minio");
-const { processImage } = require("util/imageProcessor");
+const USER = new mongoose.Types.ObjectId().toString();
+const OTHER = new mongoose.Types.ObjectId().toString();
 
-describe("UploadService", () => {
-  const userId = new mongoose.Types.ObjectId().toString();
+const tmp = (name: string, data: Buffer) => {
+  const p = path.join(os.tmpdir(), `${Date.now()}-${Math.random().toString(36).slice(2)}-${name}`);
+  fs.writeFileSync(p, data);
+  return { path: p, originalname: name, size: data.length };
+};
 
-  beforeEach(() => {
-    jest.clearAllMocks();
+const png = () => sharp({ create: { width: 40, height: 30, channels: 3, background: "#336699" } }).png().toBuffer();
+
+beforeEach(() => jest.clearAllMocks());
+
+describe("uploadImage", () => {
+  it("re-encodes a real image to WebP under the user's folder and removes the temp file", async () => {
+    const file = tmp("photo.png", await png());
+    const res = await UploadService.uploadImage(file, USER);
+    expect(res.key).toMatch(new RegExp(`^images/${USER}/[0-9a-f]{8}-photo\\.webp$`));
+    expect(uploadToMinio).toHaveBeenCalledWith(expect.any(Buffer), res.key, "image/webp");
+    expect(fs.existsSync(file.path)).toBe(false);
   });
 
-  describe("uploadFile", () => {
-    const mockFile = {
-      buffer: Buffer.from("test-file-content"),
-      originalname: "photo.jpg",
-      mimetype: "image/jpeg",
-    } as Express.Multer.File;
-
-    it("should process and upload an image", async () => {
-      const processedResult = {
-        buffer: Buffer.from("processed-image"),
-        filename: "abc12345-photo.webp",
-        contentType: "image/webp",
-      };
-
-      (processImage as jest.Mock).mockResolvedValue(processedResult);
-      (uploadToMinio as jest.Mock).mockResolvedValue(
-        "https://minio.example.com/bucket/images/user123/abc12345-photo.webp",
-      );
-
-      const result = await UploadService.uploadFile(mockFile, "image", userId);
-
-      expect(result).toEqual({
-        url: `http://localhost:5000/api/v1/upload/files/images/${userId}/abc12345-photo.webp`,
-        key: `images/${userId}/abc12345-photo.webp`,
-      });
-      expect(processImage).toHaveBeenCalledWith({
-        buffer: mockFile.buffer,
-        originalName: "photo.jpg",
-        profile: "profile",
-      });
-      expect(uploadToMinio).toHaveBeenCalledWith(
-        processedResult.buffer,
-        `images/${userId}/abc12345-photo.webp`,
-        "image/webp",
-      );
-    });
-
-    it("should process and upload a document", async () => {
-      const docFile = {
-        buffer: Buffer.from("doc-content"),
-        originalname: "id-card.png",
-        mimetype: "image/png",
-      } as Express.Multer.File;
-
-      const processedResult = {
-        buffer: Buffer.from("processed-doc"),
-        filename: "xyz98765-id-card.webp",
-        contentType: "image/webp",
-      };
-
-      (processImage as jest.Mock).mockResolvedValue(processedResult);
-
-      const result = await UploadService.uploadFile(docFile, "document", userId);
-
-      expect(result).toEqual({
-        url: `http://localhost:5000/api/v1/upload/files/documents/${userId}/xyz98765-id-card.webp`,
-        key: `documents/${userId}/xyz98765-id-card.webp`,
-      });
-      expect(processImage).toHaveBeenCalledWith({
-        buffer: docFile.buffer,
-        originalName: "id-card.png",
-        profile: "document",
-      });
-    });
-
-    it("should throw 400 if no file provided", async () => {
-      await expect(
-        UploadService.uploadFile(undefined as any, "image", userId),
-      ).rejects.toThrow(AppError);
-      await expect(
-        UploadService.uploadFile(undefined as any, "image", userId),
-      ).rejects.toMatchObject({
-        statusCode: 400,
-        message: "No file provided",
-      });
-    });
-
-    it("should throw 400 if file is null", async () => {
-      await expect(
-        UploadService.uploadFile(null as any, "image", userId),
-      ).rejects.toThrow(AppError);
-    });
+  it("looks at the bytes, not the name: a script renamed .jpg is refused (UP-05)", async () => {
+    const file = tmp("evil.jpg", Buffer.from("<html><script>alert(1)</script></html>"));
+    await expect(UploadService.uploadImage(file, USER)).rejects.toMatchObject({ code: "INVALID_IMAGE" });
+    expect(uploadToMinio).not.toHaveBeenCalled();
+    expect(fs.existsSync(file.path)).toBe(false);
   });
 
-  describe("deleteFile", () => {
-    it("should delete a file from minio", async () => {
-      const key = "images/user123/photo.webp";
-      (deleteFromMinio as jest.Mock).mockResolvedValue(undefined);
+  it("SVG is refused for normal users and sanitised for staff", async () => {
+    const svg = Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(1)</script><circle cx="5" cy="5" r="4"/></svg>',
+    );
+    await expect(UploadService.uploadImage(tmp("icon.svg", svg), USER)).rejects.toMatchObject({ code: "SVG_NOT_ALLOWED" });
 
-      await UploadService.deleteFile(key);
+    const res = await UploadService.uploadImage(tmp("icon.svg", svg), USER, { isStaff: true });
+    expect(res.key).toMatch(new RegExp(`^icons/${USER}/`));
+    const stored = (uploadToMinio as jest.Mock).mock.calls[0][0].toString();
+    expect(stored).not.toContain("script");
+    expect(stored).not.toContain("onload");
+    expect(stored).toContain("circle");
+  });
+});
 
-      expect(deleteFromMinio).toHaveBeenCalledWith(key);
-      expect(deleteFromMinio).toHaveBeenCalledTimes(1);
+describe("uploadDocument (KYC)", () => {
+  it("stores photos in the private documents/ area", async () => {
+    const res = await UploadService.uploadDocument(tmp("id.png", await png()), USER);
+    expect(res.key).toMatch(new RegExp(`^documents/${USER}/`));
+  });
+  it("PDF is not accepted (nothing can read it)", async () => {
+    const pdf = Buffer.from("%PDF-1.4 fake pdf content here");
+    await expect(UploadService.uploadDocument(tmp("id.pdf", pdf), USER)).rejects.toMatchObject({ code: "INVALID_DOCUMENT" });
+  });
+});
+
+describe("uploadVideo (UP-02)", () => {
+  const mp4 = () => Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypmp42"), Buffer.alloc(32)]);
+
+  it("is streamed from disk, never buffered in memory", async () => {
+    const file = tmp("clip.mp4", mp4());
+    const res = await UploadService.uploadVideo(file, USER);
+    expect(res.key).toMatch(new RegExp(`^videos/${USER}/[0-9a-f]{8}-clip\\.mp4$`));
+    expect(uploadFileToMinio).toHaveBeenCalledWith(file.path, res.key, "video/mp4");
+    expect(fs.existsSync(file.path)).toBe(false);
+  });
+
+  it("a non-video is refused", async () => {
+    await expect(UploadService.uploadVideo(tmp("clip.mp4", Buffer.from("not a video at all......")), USER)).rejects.toMatchObject({
+      code: "INVALID_VIDEO",
     });
+  });
+});
 
-    it("should propagate minio errors", async () => {
-      (deleteFromMinio as jest.Mock).mockRejectedValue(
-        new Error("Minio connection failed"),
-      );
+describe("deleteFile (UP-01)", () => {
+  const key = `images/${USER}/a.webp`;
 
-      await expect(UploadService.deleteFile("bad-key")).rejects.toThrow(
-        "Minio connection failed",
-      );
-    });
+  it("another user cannot delete my file", async () => {
+    await expect(UploadService.deleteFile(key, { userId: OTHER })).rejects.toMatchObject({ statusCode: 403 });
+    expect(deleteFromMinio).not.toHaveBeenCalled();
+  });
+
+  it("the owner can delete an unused file", async () => {
+    await UploadService.deleteFile(key, { userId: USER });
+    expect(deleteFromMinio).toHaveBeenCalledWith(key);
+  });
+
+  it("a file that a job still shows cannot be deleted", async () => {
+    await Job.create({ title: "x", budget: 100, postedBy: USER, category: new mongoose.Types.ObjectId(), images: [key] });
+    await expect(UploadService.deleteFile(key, { userId: USER })).rejects.toMatchObject({ code: "FILE_IN_USE" });
+  });
+
+  it("staff can remove any unused file; junk keys are rejected", async () => {
+    await UploadService.deleteFile(key, { userId: OTHER, isStaff: true });
+    expect(deleteFromMinio).toHaveBeenCalled();
+    await expect(UploadService.deleteFile("../../etc/passwd", { userId: USER })).rejects.toMatchObject({ statusCode: 400 });
   });
 });

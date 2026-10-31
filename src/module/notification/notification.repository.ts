@@ -80,7 +80,7 @@ const markRead = async (userId: string, notificationId: string) => {
       user: new Types.ObjectId(userId),
     },
     { $set: { read: true, readAt: new Date() } },
-    { new: true },
+    { returnDocument: "after" },
   ).lean();
 };
 
@@ -96,8 +96,45 @@ const markAllRead = async (userId: string, audience?: NotificationAudience) => {
   return res.modifiedCount || 0;
 };
 
+/**
+ * Chat: keep ONE unread row per conversation (the latest message) instead of a
+ * new row for every message — the previous unread one is dropped before the new
+ * row is written, so the list stays short and correctly ordered.
+ */
+const dropUnreadChat = async (userId: string, conversationId: string): Promise<void> => {
+  try {
+    await AppNotification.deleteMany({
+      user: new Types.ObjectId(userId),
+      read: false,
+      "data.type": "chat_message",
+      "data.conversationId": conversationId,
+    });
+  } catch {
+    // best effort
+  }
+};
+
+const removeOne = async (userId: string, notificationId: string) => {
+  if (!Types.ObjectId.isValid(notificationId)) return 0;
+  const res = await AppNotification.deleteOne({
+    _id: new Types.ObjectId(notificationId),
+    user: new Types.ObjectId(userId),
+  });
+  return res.deletedCount || 0;
+};
+
+const removeAll = async (userId: string, audience?: NotificationAudience) => {
+  const filter: Record<string, unknown> = { user: new Types.ObjectId(userId) };
+  if (audience) filter.audience = audience;
+  const res = await AppNotification.deleteMany(filter);
+  return res.deletedCount || 0;
+};
+
 export const NotificationRepository = {
   create,
+  dropUnreadChat,
+  removeOne,
+  removeAll,
   listForUser,
   unreadCount,
   markRead,

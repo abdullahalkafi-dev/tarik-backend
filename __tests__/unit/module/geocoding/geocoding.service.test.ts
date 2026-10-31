@@ -52,14 +52,25 @@ describe("GeocodingService (HERE Map v7)", () => {
       });
     });
 
-    it("should return empty object on API failure", async () => {
+    it("tells the app when the geocoder is down instead of returning an empty address (FH-05)", async () => {
       global.fetch = jest.fn().mockResolvedValue({
         ok: false,
         status: 500,
       } as any);
 
-      const result = await GeocodingService.reverseGeocode(0, 0);
-      expect(result).toEqual({});
+      await expect(GeocodingService.reverseGeocode(33.57, -7.58)).rejects.toMatchObject({
+        statusCode: 502,
+        code: "GEOCODER_UNAVAILABLE",
+      });
+    });
+
+    it("refuses coordinates outside the service area (GE-03)", async () => {
+      global.fetch = jest.fn();
+      await expect(GeocodingService.reverseGeocode(0, 0)).rejects.toMatchObject({
+        statusCode: 422,
+        code: "OUTSIDE_SERVICE_AREA",
+      });
+      expect(global.fetch).not.toHaveBeenCalled();
     });
   });
 
@@ -107,14 +118,31 @@ describe("GeocodingService (HERE Map v7)", () => {
       });
     });
 
-    it("should return empty array on API failure", async () => {
+    it("reports an API failure as an error the app can show", async () => {
       global.fetch = jest.fn().mockResolvedValue({
         ok: false,
         status: 400,
       } as any);
 
-      const results = await GeocodingService.forwardGeocode("Invalid Query", 5);
-      expect(results).toEqual([]);
+      await expect(GeocodingService.forwardGeocode("Invalid Query", 5)).rejects.toMatchObject({
+        statusCode: 502,
+        code: "GEOCODER_UNAVAILABLE",
+      });
+    });
+
+    it("drops results outside Morocco", async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          items: [
+            { title: "London", address: { label: "London, UK" }, position: { lat: 51.5, lng: -0.12 } },
+            { title: "Fes", address: { label: "Fes, Morocco", city: "Fes" }, position: { lat: 34.03, lng: -5.0 } },
+          ],
+        }),
+      } as any);
+
+      const results = await GeocodingService.forwardGeocode("city", 5);
+      expect(results.map((r) => r.displayName)).toEqual(["Fes, Morocco"]);
     });
   });
 });

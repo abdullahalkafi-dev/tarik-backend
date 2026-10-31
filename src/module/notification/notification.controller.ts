@@ -50,7 +50,10 @@ const markRead = catchAsync(async (req, res) => {
 });
 
 const markAllRead = catchAsync(async (req, res) => {
-  const result = await NotificationService.markAllRead(req.user?._id as string);
+  const result = await NotificationService.markAllRead(
+    req.user?._id as string,
+    req.query.audience as string | undefined,
+  );
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -60,7 +63,34 @@ const markAllRead = catchAsync(async (req, res) => {
   });
 });
 
+const removeOne = catchAsync(async (req, res) => {
+  const result = await NotificationService.removeOne(req.user?._id as string, req.params.id as string);
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Notification deleted",
+    data: result,
+  });
+});
+
+const removeAll = catchAsync(async (req, res) => {
+  const result = await NotificationService.removeAll(
+    req.user?._id as string,
+    req.query.audience as string | undefined,
+  );
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Notifications cleared",
+    data: result,
+  });
+});
+
 export const NotificationController = {
+  removeOne,
+  removeAll,
   listNotifications,
   unreadCount,
   markRead,

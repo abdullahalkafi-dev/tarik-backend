@@ -1,11 +1,12 @@
+import crypto from "crypto";
 import sharp from "sharp";
 import { optimize } from "svgo";
-import path from "path";
 
 type ImageProfile = "profile" | "document";
 
 interface ProcessImageOptions {
-  buffer: Buffer;
+  /** Path of the uploaded temp file (images are never held fully in memory by the HTTP layer). */
+  filePath: string;
   originalName: string;
   profile: ImageProfile;
 }
@@ -16,15 +17,12 @@ interface ProcessedImage {
   contentType: string;
 }
 
-const PROFILE_CONFIG: sharp.WebpOptions = {
-  quality: 75,
-  effort: 2,
-};
-
-const DOCUMENT_CONFIG: sharp.WebpOptions = {
-  quality: 100,
-  effort: 2,
-};
+// Profile/job/chat photos: light. Documents (ID cards, selfies): kept sharp enough
+// for a human reviewer to read the print.
+const PROFILE_CONFIG: sharp.WebpOptions = { quality: 80, effort: 2 };
+const DOCUMENT_CONFIG: sharp.WebpOptions = { quality: 85, effort: 2 };
+const PROFILE_MAX = 1280;
+const DOCUMENT_MAX = 2000;
 
 const generateFilename = (originalName: string, ext: string): string => {
   const baseName = originalName.replace(/\.[^.]+$/, "");
@@ -33,51 +31,53 @@ const generateFilename = (originalName: string, ext: string): string => {
   return `${uuid}-${safeName}${ext}`;
 };
 
-const isSvg = (filename: string): boolean => {
-  return path.extname(filename).toLowerCase() === ".svg";
-};
-
-const sanitizeSvg = (buffer: Buffer): Buffer => {
-  const result = optimize(buffer.toString("utf-8"), {
+/**
+ * Admin-only icons: remove everything that can execute (scripts, event
+ * handlers, foreign objects, external references) before storing.
+ */
+export const sanitizeSvg = (raw: string): Buffer => {
+  const result = optimize(raw, {
     plugins: [
       "preset-default",
       "removeDimensions",
+      "removeScripts",
+      "removeUnknownsAndDefaults",
       {
         name: "removeAttrs",
-        params: { attrs: "(data-*|onclick|onload|onerror)" },
+        params: { attrs: "(data-.*|on[a-z]+)" },
       },
       {
         name: "addAttributesToSVGElement",
-        params: {
-          attributes: [{ xmlns: "http://www.w3.org/2000/svg" }],
-        },
+        params: { attributes: [{ xmlns: "http://www.w3.org/2000/svg" }] },
       },
     ],
   });
-  return Buffer.from(result.data, "utf-8");
+  const cleaned = result.data
+    .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    // external references (links, remote images) are not needed for an icon
+    .replace(/\s(?:xlink:)?href\s*=\s*("[^"]*"|'[^']*')/gi, "")
+    .replace(/javascript:/gi, "");
+  return Buffer.from(cleaned, "utf-8");
 };
 
+export const processSvg = (raw: string, originalName: string): ProcessedImage => ({
+  buffer: sanitizeSvg(raw),
+  filename: generateFilename(originalName, ".svg"),
+  contentType: "image/svg+xml",
+});
+
 export const processImage = async ({
-  buffer,
+  filePath,
   originalName,
   profile,
 }: ProcessImageOptions): Promise<ProcessedImage> => {
-  // SVGs: sanitize only, skip Sharp processing
-  if (isSvg(originalName)) {
-    const sanitized = sanitizeSvg(buffer);
-    return {
-      buffer: sanitized,
-      filename: generateFilename(originalName, ".svg"),
-      contentType: "image/svg+xml",
-    };
-  }
-
-  // Raster images: convert to WebP
   const config = profile === "profile" ? PROFILE_CONFIG : DOCUMENT_CONFIG;
+  const max = profile === "profile" ? PROFILE_MAX : DOCUMENT_MAX;
 
-  const processedBuffer = await sharp(buffer, { failOn: "none" })
+  const processedBuffer = await sharp(filePath, { failOn: "none" })
     .rotate()
-    .resize({ width: 960, height: 960, fit: "inside", withoutEnlargement: true })
+    .resize({ width: max, height: max, fit: "inside", withoutEnlargement: true })
     .webp(config)
     .toBuffer();
 

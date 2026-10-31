@@ -1,50 +1,13 @@
 import z from "zod";
 
-const registerDto = z.object({
-  body: z
-    .object({
-      email: z.string().trim().email("Invalid email address"),
-      password: z.string().min(6, "Password must be at least 6 characters"),
-      name: z.string().trim().min(1, "Name is required").max(100),
-      role: z.enum(["user", "helper"]).default("user"),
-    })
-    .strict(),
-});
+const passwordRule = z.string().min(8, "Password must be at least 8 characters").max(128);
 
-const verifyOtpDto = z.object({
-  body: z
-    .object({
-      email: z.email("Invalid email address"),
-      otp: z.string().length(4, "OTP must be 4 digits"),
-    })
-    .strict(),
-});
-
-const resendOtpDto = z.object({
-  body: z
-    .object({
-      email: z.string().trim().email("Invalid email address"),
-    })
-    .strict(),
-});
-
+// E-mail + password login exists for admin / staff only (the mobile apps use the phone flow).
 const loginDto = z.object({
   body: z
     .object({
       email: z.string().trim().email("Invalid email address"),
-      password: z.string().min(1, "Password is required"),
-    })
-    .strict(),
-});
-
-const googleLoginDto = z.object({
-  body: z
-    .object({
-      email: z.email("Invalid email address"),
-      name: z.string().trim().min(1, "Name is required"),
-      googleId: z.string().min(1, "Google ID is required"),
-      avatar: z.string().url("Invalid avatar URL").optional(),
-      role: z.enum(["user", "helper"]).default("user"),
+      password: z.string().min(1, "Password is required").max(128),
     })
     .strict(),
 });
@@ -57,28 +20,20 @@ const refreshTokenDto = z.object({
     .strict(),
 });
 
-const forgotPasswordDto = z.object({
+const logoutDto = z.object({
   body: z
     .object({
-      email: z.email("Invalid email address"),
+      refreshToken: z.string().optional(),
     })
-    .strict(),
+    .strict()
+    .optional(),
 });
 
-const verifyResetOtpDto = z.object({
+const changePasswordDto = z.object({
   body: z
     .object({
-      email: z.email("Invalid email address"),
-      otp: z.string().length(4, "OTP must be 4 digits"),
-    })
-    .strict(),
-});
-
-const resetPasswordDto = z.object({
-  body: z
-    .object({
-      resetToken: z.string().min(1, "Reset token is required"),
-      newPassword: z.string().min(6, "Password must be at least 6 characters"),
+      currentPassword: z.string().min(1, "Current password is required").max(128),
+      newPassword: passwordRule,
     })
     .strict(),
 });
@@ -87,7 +42,7 @@ const phoneRegisterDto = z.object({
   body: z
     .object({
       phone: z.string().trim().min(1, "Phone number is required"),
-      password: z.string().min(6, "Password must be at least 6 characters"),
+      password: passwordRule,
       name: z.string().trim().min(1, "Name is required").max(100),
       role: z.enum(["user", "helper"]).default("user"),
     })
@@ -115,7 +70,7 @@ const phoneLoginDto = z.object({
   body: z
     .object({
       phone: z.string().trim().min(1, "Phone number is required"),
-      password: z.string().min(1, "Password is required"),
+      password: z.string().min(1, "Password is required").max(128),
       loginAs: z.enum(["user", "helper"]).optional(),
     })
     .strict(),
@@ -142,21 +97,16 @@ const resetPasswordPhoneDto = z.object({
   body: z
     .object({
       resetToken: z.string().min(1, "Reset token is required"),
-      newPassword: z.string().min(6, "Password must be at least 6 characters"),
+      newPassword: passwordRule,
     })
     .strict(),
 });
 
 export const AuthDto = {
-  register: registerDto,
-  verifyOtp: verifyOtpDto,
-  resendOtp: resendOtpDto,
   login: loginDto,
-  googleLogin: googleLoginDto,
   refreshToken: refreshTokenDto,
-  forgotPassword: forgotPasswordDto,
-  verifyResetOtp: verifyResetOtpDto,
-  resetPassword: resetPasswordDto,
+  logout: logoutDto,
+  changePassword: changePasswordDto,
   // Phone auth
   phoneRegister: phoneRegisterDto,
   verifyPhoneOtp: verifyPhoneOtpDto,

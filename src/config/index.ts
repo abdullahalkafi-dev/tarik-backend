@@ -5,7 +5,8 @@ dotenv.config({ path: path.join(process.cwd(), ".env") });
 
 export default {
   app_name: process.env.APP_NAME || "Tarik",
-  node_env: process.env.NODE_ENV || "development",
+  // Unknown environments behave like production (no stack traces, no body logging).
+  node_env: process.env.NODE_ENV || "production",
   port: process.env.PORT || "5000",
 
   database_url: process.env.DATABASE_URL,
@@ -20,7 +21,7 @@ export default {
 
   jwt: {
     jwt_secret: process.env.JWT_SECRET,
-    jwt_expire_in: process.env.JWT_EXPIRE_IN || "30d",
+    jwt_expire_in: process.env.JWT_EXPIRE_IN || "24h",
     jwt_refresh_secret: process.env.JWT_REFRESH_SECRET,
     jwt_refresh_expire_in: process.env.JWT_REFRESH_EXPIRE_IN || "30d",
   },
@@ -37,23 +38,6 @@ export default {
     ttl: {
       userProfileSeconds: process.env.CACHE_USER_PROFILE_TTL_SECONDS || "300",
     },
-  },
-
-  resend: {
-    api_key: process.env.RESEND_API_KEY,
-    mail_domain: process.env.MAIL_DOMAIN,
-  },
-
-  aws_s3: {
-    access_key_id: process.env.AWS_ACCESS_KEY_ID,
-    secret_access_key: process.env.AWS_SECRET_ACCESS_KEY,
-    region: process.env.AWS_REGION || "us-east-1",
-    bucket: process.env.AWS_S3_BUCKET || "tarik-app-bucket",
-  },
-
-  stripe: {
-    secret_key: process.env.STRIPE_SECRET_KEY,
-    webhook_secret: process.env.STRIPE_WEBHOOK_SECRET,
   },
 
   socket: {
@@ -83,12 +67,6 @@ export default {
     })(),
   },
 
-  logging: {
-    level: process.env.LOG_LEVEL || "debug",
-    format: process.env.LOG_FORMAT || "json",
-    enable_request_logging: process.env.ENABLE_REQUEST_LOGGING !== "false",
-  },
-
   rate_limit: {
     window_ms: process.env.RATE_LIMIT_WINDOW_MS || "900000",
     max_requests: process.env.RATE_LIMIT_MAX_REQUESTS || "100",
@@ -97,6 +75,8 @@ export default {
   cors: {
     origin: process.env.CORS_ORIGIN || "http://localhost:3000",
     credentials: process.env.CORS_CREDENTIALS !== "false",
+    // true = browsers from unknown origins are rejected (set in production)
+    strict: process.env.CORS_STRICT === "true",
   },
 
   minio: {
@@ -108,11 +88,6 @@ export default {
     use_ssl: process.env.MINIO_USE_SSL === "true",
     base_url: process.env.MINIO_BASE_URL || "http://localhost:9000",
     public_url: process.env.MINIO_PUBLIC_URL || process.env.MINIO_BASE_URL || "http://localhost:9000",
-  },
-
-  upload: {
-    dir: process.env.UPLOAD_DIR || "./uploads",
-    max_file_size_mb: process.env.MAX_FILE_SIZE_MB || "50",
   },
 
   urls: {
@@ -145,6 +120,6 @@ export default {
   },
 
   geo: {
-    allowed_countries: process.env.ALLOWED_COUNTRIES || "MAR,BGD,GBR,GB",
+    allowed_countries: process.env.ALLOWED_COUNTRIES || "MAR",
   },
 };

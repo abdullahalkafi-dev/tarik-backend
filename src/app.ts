@@ -12,6 +12,7 @@ import {
 import {
   performanceMonitor,
   healthCheck,
+  livenessCheck,
   apiUsageTracker,
 } from "./middlewares/performanceMonitor";
 import config from "./config";
@@ -20,6 +21,7 @@ import { buildCachePattern } from "./redis/cache.utils";
 import { Morgan } from "./logger/morgan";
 import globalErrorHandler from "./middlewares/globalErrorHandler";
 import { requireAdminApiKey } from "./middlewares/adminApiKey";
+import { getAllowedOrigins } from "./config/origins";
 
 const app: express.Application = express();
 
@@ -29,39 +31,20 @@ app.set("trust proxy", 1);
 // 2. Security
 app.use(helmetConfig);
 
-// 3. CORS
-const getAllowedOrigins = (): string[] => {
-  const configured = config.cors.origin
-    ? config.cors.origin.split(",").map((o: string) => o.trim()).filter(Boolean)
-    : [];
-
-  const defaults = [
-    "https://tarikapp.joura.info",
-    "https://tarikappapi.joura.info",
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://localhost:3002",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:3001",
-    "http://127.0.0.1:3002",
-  ];
-
-  return Array.from(new Set([...configured, ...defaults]));
-};
-
+// 3. CORS — one allow-list shared with Socket.IO (config/origins.ts).
+// Set CORS_STRICT=true in production to reject unknown browser origins; the
+// mobile apps send no Origin header and are never affected.
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (e.g. mobile apps, Postman, curl)
       if (!origin) return callback(null, true);
       const allowed = getAllowedOrigins();
-      if (allowed.includes(origin) || allowed.includes("*")) {
-        return callback(null, true);
-      }
-      return callback(null, true);
+      if (allowed.includes(origin) || allowed.includes("*")) return callback(null, true);
+      return callback(null, !config.cors.strict);
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Range"],
+    exposedHeaders: ["Content-Range", "Accept-Ranges", "Content-Length"],
     credentials: true,
     maxAge: 86400,
   }),
@@ -94,11 +77,10 @@ app.use(additionalSanitization);
 app.use(performanceMonitor.requestMonitor());
 app.use(apiUsageTracker);
 
-// 9. Static files
-app.use("/uploads", express.static("uploads", { maxAge: "1d", etag: true, dotfiles: "deny" }));
-
 // 10. Health check
 app.get("/health", healthCheck);
+app.get("/health/ready", healthCheck);
+app.get("/health/live", livenessCheck);
 
 // 11. Root route
 app.get("/", (_req: Request, res: Response) => {

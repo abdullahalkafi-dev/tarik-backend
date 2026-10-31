@@ -111,20 +111,27 @@ export const healthCheck = async (_req: Request, res: Response) => {
       ? "connected"
       : "disconnected";
 
-  const status =
-    dbStatus === "connected" &&
-    systemHealth.memory.heapUsed < 500 &&
-    (redisStatus === "connected" || redisStatus === "disabled")
-      ? "healthy"
-      : "degraded";
+  // Readiness = the database answers. Redis or memory trouble is reported as
+  // "degraded" but must NOT make an orchestrator/uptime tool restart the API.
+  const ready = dbStatus === "connected";
+  const status = !ready
+    ? "unhealthy"
+    : redisStatus === "disconnected" || systemHealth.memory.heapUsed >= 500
+      ? "degraded"
+      : "healthy";
 
-  res.status(status === "healthy" ? 200 : 503).json({
+  res.status(ready ? 200 : 503).json({
     status,
     timestamp: new Date().toISOString(),
     uptime: systemHealth.uptime,
     database: dbStatus,
     redis: redisStatus,
   });
+};
+
+/** Liveness: the process is up and the event loop answers. */
+export const livenessCheck = (_req: Request, res: Response) => {
+  res.status(200).json({ status: "alive", uptime: Math.round(process.uptime()) });
 };
 
 export const performanceDashboard = (_req: Request, res: Response) => {

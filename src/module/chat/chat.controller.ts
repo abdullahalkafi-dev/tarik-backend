@@ -13,7 +13,10 @@ const p = (req: any, key: string) => String(req.params[key]);
 
 // ─── List Conversations ────────────────────────────────
 const listConversations = catchAsync(async (req, res) => {
-  const result = await ChatService.listConversations(uid(req));
+  const result = await ChatService.listConversations(uid(req), {
+    limit: Number(req.query.limit) || undefined,
+    before: req.query.before as string | undefined,
+  });
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -123,6 +126,7 @@ const acceptOffer = catchAsync(async (req, res) => {
     p(req, "conversationId"),
     uid(req),
     p(req, "offerId"),
+    Number(req.body.version),
   );
 
   sendResponse(res, {
@@ -198,7 +202,68 @@ const markRead = catchAsync(async (req, res) => {
   });
 });
 
+const getPresence = catchAsync(async (req, res) => {
+  const ids = String(req.query.ids || "").split(",").filter(Boolean);
+  const result = await ChatService.getPresence(uid(req), ids);
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Presence fetched",
+    data: result,
+  });
+});
+
+const getUnreadTotal = catchAsync(async (req, res) => {
+  const result = await ChatService.getUnreadTotal(uid(req));
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Unread count fetched",
+    data: result,
+  });
+});
+
+const blockConversation = catchAsync(async (req, res) => {
+  const result = await ChatService.setBlocked(p(req, "conversationId"), uid(req), true);
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Conversation blocked",
+    data: result,
+  });
+});
+
+const unblockConversation = catchAsync(async (req, res) => {
+  const result = await ChatService.setBlocked(p(req, "conversationId"), uid(req), false);
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Conversation unblocked",
+    data: result,
+  });
+});
+
+const reportConversation = catchAsync(async (req, res) => {
+  const result = await ChatService.reportConversation(p(req, "conversationId"), uid(req), req.body);
+
+  sendResponse(res, {
+    statusCode: StatusCodes.CREATED,
+    success: true,
+    message: "Report sent. Thank you.",
+    data: result,
+  });
+});
+
 export const ChatController = {
+  getPresence,
+  getUnreadTotal,
+  blockConversation,
+  unblockConversation,
+  reportConversation,
   listConversations,
   createOrGetConversation,
   getMessages,

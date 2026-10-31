@@ -9,6 +9,15 @@ const pricingFields = {
   suggestedPriceMax: price,
 };
 
+const names = z
+  .object({
+    en: z.string().trim().max(100).optional(),
+    fr: z.string().trim().max(100).optional(),
+    ar: z.string().trim().max(100).optional(),
+    es: z.string().trim().max(100).optional(),
+  })
+  .strict();
+
 const refinePriceRange = (
   data: { suggestedPriceMin?: number | null; suggestedPriceMax?: number | null },
   ctx: z.RefinementCtx,
@@ -23,11 +32,15 @@ const refinePriceRange = (
   }
 };
 
+// `icon` is an uploaded file key (icons/…, images/…) or a file URL from this API.
 const createDto = z.object({
   body: z
     .object({
       name: z.string().trim().min(1, "Name is required").max(100),
-      icon: z.string().url("Invalid icon URL").optional(),
+      icon: z.string().max(500).optional(),
+      names: names.optional(),
+      sortOrder: z.number().int().min(0).max(10000).optional(),
+      isPopular: z.boolean().optional(),
       ...pricingFields,
     })
     .strict()
@@ -38,8 +51,11 @@ const updateDto = z.object({
   body: z
     .object({
       name: z.string().trim().min(1).max(100).optional(),
-      icon: z.string().url("Invalid icon URL").optional(),
+      icon: z.string().max(500).optional(),
       isActive: z.boolean().optional(),
+      names: names.optional(),
+      sortOrder: z.number().int().min(0).max(10000).optional(),
+      isPopular: z.boolean().optional(),
       ...pricingFields,
     })
     .strict()

@@ -1,5 +1,5 @@
 import { Router } from "express";
-import auth from "@middlewares/auth";
+import auth, { requirePermission } from "@middlewares/auth";
 import validateRequest from "@middlewares/validateRequest";
 import { AdminController } from "./admin.controller";
 import { AdminDto } from "./admin.dto";
@@ -8,186 +8,143 @@ import { SettingsRoutes } from "../settings/settings.route";
 
 const router = Router();
 
+/** Any staff account (admin / staff / super admin). What each one may DO is the permission below. */
+const staff = auth("superAdmin", "admin", "staff");
+
 // ─── Admin Self-Profile ──────────────────────────────────────────────────────
 /**
  * @route   GET /api/v1/admin/me
  * @desc    Get authenticated admin/staff profile, role, and permissions
- * @access  Private (superAdmin, admin, staff)
  */
-router.get("/me", auth("superAdmin", "admin", "staff"), AdminController.getAdminProfile);
+router.get("/me", staff, AdminController.getAdminProfile);
 
 /**
  * @route   PATCH /api/v1/admin/me
  * @desc    Update own admin/staff profile (name, phone, avatar)
- * @access  Private (superAdmin, admin, staff)
  */
-router.patch("/me", auth("superAdmin", "admin", "staff"), AdminController.updateAdminProfile);
+router.patch("/me", staff, validateRequest(AdminDto.updateProfile), AdminController.updateAdminProfile);
 
 // ─── Platform Stats ──────────────────────────────────────────────────────────
 /**
  * @route   GET /api/v1/admin/stats
- * @desc    Get platform stats (users, helpers, applications, appeals)
- * @access  Private (superAdmin, admin, staff)
+ * @desc    Platform stats (customers, helpers, bookings, real commission earnings)
+ * @access  stats.view
  */
-router.get("/stats", auth("superAdmin", "admin", "staff"), AdminController.getStats);
+router.get("/stats", staff, requirePermission("stats.view"), AdminController.getStats);
 
 // ─── Job Pipeline / Cancellations ────────────────────────────────────────────
-/**
- * @route   GET /api/v1/admin/jobs/pipeline-summary
- * @desc    Counts per job status for Bookings panel
- * @access  Private (superAdmin, admin, staff)
- */
 router.get(
   "/jobs/pipeline-summary",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("jobs.view"),
   AdminController.getJobPipelineSummary,
 );
 
-/**
- * @route   GET /api/v1/admin/jobs/cancellations
- * @desc    Paginated cancelled jobs with client/helper names + lifetime cancel counts
- * @access  Private (superAdmin, admin, staff)
- */
 router.get(
   "/jobs/cancellations",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("jobs.view"),
   AdminController.getJobCancellations,
 );
 
 // ─── Live Fleet Map ──────────────────────────────────────────────────────────
-/**
- * @route   GET /api/v1/admin/map/helpers
- * @desc    Get live & last known helper locations for admin fleet map
- * @access  Private (superAdmin, admin, staff)
- */
 router.get(
   "/map/helpers",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("map.view"),
+  validateRequest(AdminDto.mapQuery),
   AdminController.getLiveHelperLocations,
 );
 
 // ─── Helper Applications ─────────────────────────────────────────────────────
-/**
- * @route   GET /api/v1/admin/helpers
- * @desc    List helper applications (filterable by status)
- * @access  Private (superAdmin, admin, staff)
- */
 router.get(
   "/helpers",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("helpers.view"),
   validateRequest(AdminDto.listHelpers),
   AdminController.listHelperApplications,
 );
 
-/**
- * @route   GET /api/v1/admin/helpers/:userId
- * @desc    Get full helper verification profile and audit logs
- * @access  Private (superAdmin, admin, staff)
- */
 router.get(
   "/helpers/:userId",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("helpers.view"),
   validateRequest(AdminDto.getHelperById),
   AdminController.getHelperById,
 );
 
-/**
- * @route   POST /api/v1/admin/helpers/:userId/approve
- * @desc    Approve a helper application
- * @access  Private (superAdmin, admin, staff)
- */
+/** Click-to-reveal phone / e-mail (the access is written to the audit trail). */
+router.get(
+  "/helpers/:userId/contact",
+  staff,
+  requirePermission("helpers.view"),
+  validateRequest(AdminDto.getHelperById),
+  AdminController.getHelperContact,
+);
+
 router.post(
   "/helpers/:userId/approve",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("helpers.review"),
   validateRequest(AdminDto.approveHelper),
   AdminController.approveHelper,
 );
 
-/**
- * @route   POST /api/v1/admin/helpers/:userId/reject
- * @desc    Reject a helper application with feedback
- * @access  Private (superAdmin, admin, staff)
- */
 router.post(
   "/helpers/:userId/reject",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("helpers.review"),
   validateRequest(AdminDto.rejectHelper),
   AdminController.rejectHelper,
 );
 
-/**
- * @route   POST /api/v1/admin/helpers/:userId/ban
- * @desc    Permanently ban helper + blacklist phone & Moroccan ID
- * @access  Private (superAdmin, admin, staff)
- */
 router.post(
   "/helpers/:userId/ban",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("helpers.review"),
   validateRequest(AdminDto.permanentBanHelper),
   AdminController.permanentBanHelper,
 );
 
-/**
- * @route   POST /api/v1/admin/helpers/:userId/unban
- * @desc    Unban helper, restore account, remove document from blacklist
- * @access  Private (superAdmin, admin, staff)
- */
 router.post(
   "/helpers/:userId/unban",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("helpers.review"),
   validateRequest(AdminDto.unbanHelper),
   AdminController.unbanHelper,
 );
 
 // ─── Users / Customers ───────────────────────────────────────────────────────
-/**
- * @route   GET /api/v1/admin/users
- * @desc    List registered users / customers
- * @access  Private (superAdmin, admin, staff)
- */
 router.get(
   "/users",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("users.view"),
   validateRequest(AdminDto.listUsers),
   AdminController.listUsers,
 );
 
-/**
- * @route   GET /api/v1/admin/users/:userId
- * @desc    Get user details
- * @access  Private (superAdmin, admin, staff)
- */
-router.get(
-  "/users/:userId",
-  auth("superAdmin", "admin", "staff"),
-  AdminController.getUserById,
-);
+router.get("/users/:userId", staff, requirePermission("users.view"), AdminController.getUserById);
 
-/**
- * @route   POST /api/v1/admin/users/:userId/block
- * @desc    Toggle block status for a user
- * @access  Private (superAdmin, admin, staff)
- */
+/** Block with a mandatory reason; running jobs are cancelled with refunds, sessions end. */
 router.post(
   "/users/:userId/block",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("users.manage"),
   validateRequest(AdminDto.blockUser),
   AdminController.blockUser,
 );
 
+router.post(
+  "/users/:userId/unblock",
+  staff,
+  requirePermission("users.manage"),
+  validateRequest(AdminDto.unblockUser),
+  AdminController.unblockUser,
+);
+
 // ─── Staff Management (Super Admin Only) ─────────────────────────────────────
-/**
- * @route   GET /api/v1/admin/staff
- * @desc    List all staff members
- * @access  Private (superAdmin only)
- */
 router.get("/staff", auth("superAdmin"), AdminController.getStaffList);
 
-/**
- * @route   POST /api/v1/admin/staff
- * @desc    Create a new staff member with email/password (auto-verified)
- * @access  Private (superAdmin only)
- */
 router.post(
   "/staff",
   auth("superAdmin"),
@@ -195,11 +152,6 @@ router.post(
   AdminController.createStaff,
 );
 
-/**
- * @route   PATCH /api/v1/admin/staff/:staffId
- * @desc    Update staff permissions, status, or profile
- * @access  Private (superAdmin only)
- */
 router.patch(
   "/staff/:staffId",
   auth("superAdmin"),
@@ -207,11 +159,6 @@ router.patch(
   AdminController.updateStaff,
 );
 
-/**
- * @route   DELETE /api/v1/admin/staff/:staffId
- * @desc    Remove a staff member (guarded against deleting Super Admin)
- * @access  Private (superAdmin only)
- */
 router.delete(
   "/staff/:staffId",
   auth("superAdmin"),
@@ -220,26 +167,18 @@ router.delete(
 );
 
 // ─── Helper Work History ────────────────────────────────────────────────────
-/**
- * @route   GET /api/v1/admin/helpers/:userId/jobs
- * @desc    Get job history for a specific helper
- * @access  Private (superAdmin, admin, staff)
- */
 router.get(
   "/helpers/:userId/jobs",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("helpers.view"),
   AdminController.getHelperJobs,
 );
 
 // ─── User Booking History ──────────────────────────────────────────────────
-/**
- * @route   GET /api/v1/admin/users/:userId/bookings
- * @desc    Get booking history for a specific user
- * @access  Private (superAdmin, admin, staff)
- */
 router.get(
   "/users/:userId/bookings",
-  auth("superAdmin", "admin", "staff"),
+  staff,
+  requirePermission("users.view"),
   AdminController.getUserBookings,
 );
 
@@ -247,5 +186,3 @@ router.get(
 router.use("/settings", SettingsRoutes);
 
 export const AdminRoutes = router;
-
-

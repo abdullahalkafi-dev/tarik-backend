@@ -15,7 +15,11 @@ const getSettings = catchAsync(async (_req, res) => {
 });
 
 const updateSettings = catchAsync(async (req, res) => {
-  const result = await SettingsService.updateSettings(req.body);
+  const user = req.user as any;
+  const result = await SettingsService.updateSettings(req.body, {
+    userId: user?._id ? String(user._id) : undefined,
+    name: user?.name,
+  });
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -25,26 +29,48 @@ const updateSettings = catchAsync(async (req, res) => {
   });
 });
 
-// The seeded defaults ("… update from Admin → Settings → Legal.") are hints
-// for admins; never show them to app users — the app has its own fallback.
-const publicLegalText = (value?: string) =>
-  !value || /update from Admin/i.test(value) ? "" : value;
+const getHistory = catchAsync(async (req, res) => {
+  const result = await SettingsService.getHistory(Number(req.query.limit) || 50);
 
-const getPublicLegal = catchAsync(async (_req, res) => {
-  const settings = await SettingsService.getSettings();
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Settings history fetched",
+    data: result,
+  });
+});
+
+const langOf = (value: unknown) =>
+  typeof value === "string" ? value.slice(0, 2).toLowerCase() : "en";
+
+const getPublicLegal = catchAsync(async (req, res) => {
+  const cfg = await SettingsService.getPublicConfig(langOf(req.query.lang));
   sendResponse(res, {
     statusCode: StatusCodes.OK,
     success: true,
     message: "Legal pages fetched",
     data: {
-      termsOfService: publicLegalText(settings.legal?.termsOfService),
-      privacyPolicy: publicLegalText(settings.legal?.privacyPolicy),
+      termsOfService: cfg.termsOfService,
+      privacyPolicy: cfg.privacyPolicy,
+      version: cfg.legalVersion,
     },
+  });
+});
+
+const getPublicConfig = catchAsync(async (req, res) => {
+  const result = await SettingsService.getPublicConfig(langOf(req.query.lang));
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Config fetched",
+    data: result,
   });
 });
 
 export const SettingsController = {
   getSettings,
   updateSettings,
+  getHistory,
   getPublicLegal,
+  getPublicConfig,
 };

@@ -2,61 +2,80 @@ import { Types } from "mongoose";
 import { StatusCodes } from "http-status-codes";
 import AppError from "errors/AppError";
 import { ChatRepository } from "./chat.repository";
+import { Message } from "./message.model";
+import { Conversation } from "./conversation.model";
 import { JobRepository } from "module/job/job.repository";
+import { Job } from "module/job/job.model";
 import { UserRepository } from "module/user/user.repository";
+import { SettingsService } from "../settings/settings.service";
+import { CategoryService } from "../category/category.service";
+import { WalletRepository } from "../wallet/wallet.repository";
 import { resolveUrl } from "../../util/minio";
-import { notifyUser } from "../../util/notifyUser";
-import { calcHourlyTotalMAD, parseHoursBetween, validateTimeRange } from "../../util/hourly";
-import {
-  MessageType,
-  OfferStatus,
-  PriceType,
-  PaymentMethod,
-} from "./chat.interface";
-import { JobStatus } from "module/job/job.interface";
+import { notifyUser, notifyUserT, textFor } from "../../util/notifyUser";
+import { commissionFor, computePricing, helperNetFor } from "../../util/pricing";
+import { buildSchedule } from "../../util/schedule";
+import { maskContactInfo } from "../../util/contactMask";
+import { assertOwnUploadKeys } from "../../util/uploadKey";
+import redisClient from "../../redis/redisClient";
+import { SocketPresenceService } from "../../socket/socket.presence";
+import { logger } from "../../logger/logger";
+import { MessageType, OfferStatus, PriceType, PaymentMethod } from "./chat.interface";
+import { ACTIVE_JOB_STATUSES, JobStatus } from "module/job/job.interface";
+import { assertHelperFreeForSlot, assertScheduleNotPast, dayToDate } from "module/job/job.service";
 
-// ─── Commission & Budget Helpers ───────────────────────
-const getPlatformFeePercentage = async (): Promise<number> => {
-  let feePct = 20;
-  try {
-    const { SettingsService } = await import("../settings/settings.service");
-    const settings = await SettingsService.getSettings();
-    if (settings?.platformFeePercentage != null) {
-      feePct = settings.platformFeePercentage;
-    }
-  } catch (_) {}
-  return feePct;
-};
+const OFFER_TTL_HOURS = 48;
+const MAX_OPEN_OFFERS_PER_HELPER = 5;
+const MESSAGES_PER_MINUTE = 30;
+const NEW_CONVERSATIONS_PER_DAY = 30;
+const PAYMENT_LOCK_MINUTES = 30;
+const STAFF_ROLES = ["admin", "staff", "superAdmin"];
 
-const calculateOfferBudgetAndCommission = async (offerData: {
-  price: number;
-  priceType?: string;
-  startTime?: string;
-  endTime?: string;
-  paymentMethod?: string;
-}): Promise<{ totalBudget: number; commission: number }> => {
-  const isHourly = (offerData.priceType || "fixed") === "hourly";
-  const totalBudget = isHourly
-    ? calcHourlyTotalMAD(Number(offerData.price) || 0, offerData.startTime, offerData.endTime)
-    : Math.round(Number(offerData.price) || 0);
+// ─── Small helpers ─────────────────────────────────────
+const idOf = (v: any): string => String(v?._id ?? v ?? "");
 
-  if (offerData.paymentMethod !== "cash" && offerData.paymentMethod !== PaymentMethod.CASH) {
-    return { totalBudget, commission: 0 };
-  }
-
-  const feePct = await getPlatformFeePercentage();
-  const commission = Math.round(totalBudget * (feePct / 100));
-  return { totalBudget, commission };
-};
-
-// ─── Helper: other participant id ──────────────────────
 const getOtherParticipantId = (conversation: any, userId: string): string | null => {
-  const other = (conversation.participants || []).find(
-    (p: any) => String(p._id ?? p) !== userId,
-  );
-  if (!other) return null;
-  return String(other._id ?? other);
+  const other = (conversation.participants || []).find((p: any) => idOf(p) !== String(userId));
+  return other ? idOf(other) : null;
 };
+
+const assertParticipant = (conversation: any, userId: string) => {
+  const isParticipant = (conversation.participants || []).some((p: any) => idOf(p) === String(userId));
+  if (!isParticipant) {
+    throw new AppError(StatusCodes.FORBIDDEN, "You are not a participant in this conversation");
+  }
+};
+
+const assertNotBlocked = (conversation: any) => {
+  if ((conversation.blockedBy || []).length > 0) {
+    throw new AppError(StatusCodes.FORBIDDEN, "This conversation is blocked", {
+      code: "CONVERSATION_BLOCKED",
+    });
+  }
+};
+
+/** At most N events per minute / day per user (shared by REST and socket paths). Fails open without Redis. */
+const rateGate = async (key: string, windowSeconds: number, max: number, code: string) => {
+  if (!redisClient.isAvailable()) return;
+  try {
+    const n = await redisClient.incrWithWindow(key, windowSeconds);
+    if (n > max) {
+      throw new AppError(StatusCodes.TOO_MANY_REQUESTS, "You are doing this too fast. Please slow down.", { code });
+    }
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+  }
+};
+
+const hasJobBetween = async (a: string, b: string): Promise<boolean> =>
+  Boolean(
+    await Job.exists({
+      $or: [
+        { postedBy: a, assignedTo: b },
+        { postedBy: b, assignedTo: a },
+      ],
+      status: { $in: [...ACTIVE_JOB_STATUSES, JobStatus.COMPLETED] },
+    }),
+  );
 
 // ─── Helper: Resolve MinIO keys to URLs in message ────
 const resolveMessageUrls = (msg: any) => {
@@ -88,30 +107,17 @@ type TSendOfferPayload = {
   description?: string;
   price: number;
   priceType?: "fixed" | "hourly";
-  date?: string;
+  date: string;
   startTime?: string;
   endTime?: string;
-  address?: string;
-  longitude?: number;
-  latitude?: number;
+  address: string;
+  longitude: number;
+  latitude: number;
   paymentMethod?: "cash" | "online";
   images?: string[];
 };
 
-type TEditOfferPayload = {
-  title?: string;
-  description?: string;
-  date?: string;
-  price?: number;
-  priceType?: "fixed" | "hourly";
-  startTime?: string;
-  endTime?: string;
-  address?: string;
-  longitude?: number;
-  latitude?: number;
-  paymentMethod?: "cash" | "online";
-  images?: string[];
-};
+type TEditOfferPayload = Partial<TSendOfferPayload>;
 
 // ─── Helper: resolve participant avatar keys ───────────
 const resolveParticipant = (p: any) => {
@@ -126,21 +132,32 @@ const resolveParticipant = (p: any) => {
 };
 
 // ─── List User's Conversations ─────────────────────────
-const listConversations = async (userId: string) => {
+const listConversations = async (
+  userId: string,
+  options: { limit?: number; before?: string } = {},
+) => {
   const uid = String(userId);
-  const conversations = await ChatRepository.findUserConversations(uid);
+  const conversations = await ChatRepository.findUserConversations(uid, options);
 
-  const enriched = conversations.map((conv) => {
+  const others = conversations
+    .map((c) => getOtherParticipantId(c, uid))
+    .filter((id): id is string => Boolean(id));
+  const online = await SocketPresenceService.onlineMap(others).catch(() => ({}) as Record<string, boolean>);
+
+  return conversations.map((conv) => {
     const participants = (conv.participants || []).map(resolveParticipant);
-    const otherParticipant = participants.find(
-      (p: any) => String(p._id) !== uid,
-    );
+    const otherParticipant = participants.find((p: any) => String(p._id) !== uid) || null;
     const unreadCount = conv.unreadCounts.get(uid) || 0;
+    const otherId = otherParticipant ? String(otherParticipant._id) : "";
 
     return {
       _id: conv._id,
       participants,
-      otherParticipant: otherParticipant || null,
+      otherParticipant: otherParticipant
+        ? { ...otherParticipant, isOnline: Boolean(online[otherId]) }
+        : null,
+      isOnline: Boolean(online[otherId]),
+      isBlocked: (conv.blockedBy || []).length > 0,
       lastMessage: conv.lastMessage || null,
       lastMessageAt: conv.lastMessageAt,
       unreadCount,
@@ -148,27 +165,36 @@ const listConversations = async (userId: string) => {
       updatedAt: conv.updatedAt,
     };
   });
-
-  return enriched;
 };
 
+/** Online flags for people the caller actually shares a conversation with. */
+const getPresence = async (userId: string, ids: string[]) => {
+  const uid = String(userId);
+  const convs = await Conversation.find({ participants: uid }).select("participants").limit(1000).lean();
+  const partners = new Set<string>();
+  for (const c of convs) for (const p of c.participants || []) partners.add(String(p));
+  const allowed = ids.filter((id) => partners.has(id) && id !== uid);
+  return SocketPresenceService.onlineMap(allowed);
+};
+
+const getUnreadTotal = async (userId: string) => ({
+  unread: await ChatRepository.totalUnread(String(userId)),
+});
+
 // ─── Create or Get Conversation ────────────────────────
-const createOrGetConversation = async (
-  userId: string,
-  participantId: string,
-) => {
+const createOrGetConversation = async (userId: string, participantId: string) => {
   const uid = String(userId);
   const pid = String(participantId);
 
   if (uid === pid) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Cannot create conversation with yourself",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "Cannot create conversation with yourself");
   }
 
-  const otherUser = await UserRepository.findById(pid, { populate: "auth" });
-  if (!otherUser) {
+  const [me, otherUser] = await Promise.all([
+    UserRepository.findById(uid, { populate: "auth" }),
+    UserRepository.findById(pid, { populate: "auth" }),
+  ]);
+  if (!me || !otherUser) {
     throw new AppError(StatusCodes.NOT_FOUND, "User not found");
   }
 
@@ -179,24 +205,85 @@ const createOrGetConversation = async (
     );
   }
 
+  const existing = await Conversation.exists({
+    participants: { $all: [new Types.ObjectId(uid), new Types.ObjectId(pid)], $size: 2 },
+  });
+
+  if (!existing) {
+    // New conversations only between a client and an approved helper that are
+    // related: the client looks at a helper's profile, or the helper answers a
+    // client who posted a job. No client↔client, helper↔helper or random contact.
+    const myRole = (me.auth as any)?.role;
+    const otherRole = (otherUser.auth as any)?.role;
+    const iAmApprovedHelper = me.helperApplicationStatus === "approved";
+    const otherIsApprovedHelper = otherUser.helperApplicationStatus === "approved";
+
+    let allowed = false;
+    if (STAFF_ROLES.includes(myRole) || STAFF_ROLES.includes(otherRole)) {
+      allowed = false;
+    } else if (!iAmApprovedHelper && otherIsApprovedHelper) {
+      allowed = true; // client → helper
+    } else if (iAmApprovedHelper && !otherIsApprovedHelper && otherRole === "user") {
+      allowed = Boolean(await Job.exists({ postedBy: pid })); // helper → client who posted a job
+    }
+
+    if (!allowed) {
+      throw new AppError(StatusCodes.FORBIDDEN, "You cannot start a conversation with this user", {
+        code: "CHAT_NOT_ALLOWED",
+      });
+    }
+    await rateGate(`rl:newconv:${uid}`, 24 * 3600, NEW_CONVERSATIONS_PER_DAY, "TOO_MANY_CONVERSATIONS");
+  }
+
   const conversation = await ChatRepository.createConversation([uid, pid]);
 
-  // Build enriched response with otherParticipant
-  const participants = (conversation.participants as any[])?.map(
-    resolveParticipant,
-  ) || [];
+  const participants = (conversation.participants as any[])?.map(resolveParticipant) || [];
   const other = participants.find((p: any) => String(p._id) !== uid);
+  const isOnline = await SocketPresenceService.isUserOnline(pid).catch(() => false);
 
   return {
     _id: conversation._id,
     participants,
-    otherParticipant: other || null,
+    otherParticipant: other ? { ...other, isOnline } : null,
+    isOnline,
+    isBlocked: ((conversation as any).blockedBy || []).length > 0,
     lastMessage: conversation.lastMessage || null,
     lastMessageAt: conversation.lastMessageAt,
     unreadCount: conversation.unreadCounts?.get(uid) || 0,
     createdAt: conversation.createdAt,
     updatedAt: conversation.updatedAt,
   };
+};
+
+// ─── Block / report ────────────────────────────────────
+const setBlocked = async (conversationId: string, userId: string, blocked: boolean) => {
+  const uid = String(userId);
+  const conversation = await ChatRepository.findConversationById(conversationId);
+  if (!conversation) throw new AppError(StatusCodes.NOT_FOUND, "Conversation not found");
+  assertParticipant(conversation, uid);
+  await ChatRepository.setBlocked(conversationId, uid, blocked);
+  return { blocked };
+};
+
+const reportConversation = async (
+  conversationId: string,
+  userId: string,
+  payload: { reason: string; message?: string },
+) => {
+  const uid = String(userId);
+  const conversation = await ChatRepository.findConversationById(conversationId);
+  if (!conversation) throw new AppError(StatusCodes.NOT_FOUND, "Conversation not found");
+  assertParticipant(conversation, uid);
+  const otherId = getOtherParticipantId(conversation, uid);
+
+  const { SupportService } = await import("../support/support.service");
+  const ticket = await SupportService.createTicket(uid, {
+    subject: `Chat report: ${payload.reason}`,
+    message: payload.message?.trim() || `Reported conversation ${conversationId} (${payload.reason})`,
+    category: "safety",
+    reportedUserId: otherId || undefined,
+  });
+  return { ticketId: ticket._id };
 };
 
 // ─── Get Messages ──────────────────────────────────────
@@ -207,56 +294,42 @@ const getMessages = async (
 ) => {
   const uid = String(userId);
 
-  try {
-    await ChatRepository.expireStuckAwaitingPayment(24);
-  } catch (_) {}
-
   const conversation = await ChatRepository.findConversationById(conversationId);
   if (!conversation) {
     throw new AppError(StatusCodes.NOT_FOUND, "Conversation not found");
   }
+  assertParticipant(conversation, uid);
 
-  const isParticipant = conversation.participants.some(
-    (p: any) => String(p._id) === uid,
-  );
-  if (!isParticipant) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "You are not a participant in this conversation",
-    );
-  }
+  const result = await ChatRepository.findMessagesByConversation(conversationId, {
+    page: options.page || 1,
+    limit: options.limit || 20,
+    before: options.before,
+  });
 
-  const result = await ChatRepository.findMessagesByConversation(
-    conversationId,
-    {
-      page: options.page || 1,
-      limit: options.limit || 20,
-      before: options.before,
-    },
-  );
+  // Only the messages that were actually delivered in this page become "read"
+  // (older unread ones stay unread), and the badge shows the true remainder.
+  const unreadIds = result.docs
+    .filter(
+      (m: any) =>
+        idOf(m.sender) !== uid && !(m.readBy || []).some((r: any) => idOf(r.userId) === uid),
+    )
+    .map((m: any) => String(m._id));
 
-  const unreadMessages = await ChatRepository.findUnreadMessages(
-    conversationId,
-    uid,
-  );
-  if (unreadMessages.length > 0) {
-    const ids = unreadMessages.map((m: any) => String(m._id));
-    await ChatRepository.markMessagesRead(conversationId, uid, ids);
-    await ChatRepository.markConversationRead(
-      conversationId,
-      uid,
-      unreadMessages.length,
-    );
+  if (unreadIds.length > 0) {
+    await ChatRepository.markMessagesRead(conversationId, uid, unreadIds);
+    const remaining = await ChatRepository.countUnread(conversationId, uid);
+    await ChatRepository.setUnreadCount(conversationId, uid, remaining);
 
-    // Tell the peer we've seen their messages
     try {
       const { emitToConversation } = await import("../../socket/socket.gateway");
       emitToConversation(conversationId, "chat:read", {
         conversationId,
         userId: uid,
-        messageIds: ids,
+        messageIds: unreadIds,
       });
-    } catch (_) {}
+    } catch (_) {
+      // best effort
+    }
   }
 
   return result;
@@ -270,94 +343,162 @@ const sendMessage = async (
 ) => {
   const sid = String(senderId);
 
+  await rateGate(`rl:msg:${sid}`, 60, MESSAGES_PER_MINUTE, "MESSAGE_RATE_LIMIT");
+
   const conversation = await ChatRepository.findConversationById(conversationId);
   if (!conversation) {
     throw new AppError(StatusCodes.NOT_FOUND, "Conversation not found");
   }
+  assertParticipant(conversation, sid);
+  assertNotBlocked(conversation);
 
-  const isParticipant = conversation.participants.some(
-    (p: any) => String(p._id) === sid,
-  );
-  if (!isParticipant) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "You are not a participant in this conversation",
-    );
+  const otherId = getOtherParticipantId(conversation, sid);
+  if (otherId) {
+    const other = await UserRepository.findById(otherId, { select: "isBlocked isDeleted locale" });
+    if (!other || other.isBlocked || other.isDeleted) {
+      throw new AppError(StatusCodes.FORBIDDEN, "This user is no longer available", {
+        code: "USER_UNAVAILABLE",
+      });
+    }
   }
 
   if (payload.type === "text" && !payload.content) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Text message requires content",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "Text message requires content");
   }
   if (payload.type === "image" && (!payload.images || payload.images.length === 0)) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Image message requires at least one image",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "Image message requires at least one image");
   }
   if (payload.type === "image" && payload.images && payload.images.length > 4) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Maximum 4 images per message",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "Maximum 4 images per message");
   }
   if (payload.type === "video" && !payload.video) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Video message requires a video",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "Video message requires a video");
+  }
+
+  // Files must be the sender's own uploads.
+  const images = payload.type === "image" ? assertOwnUploadKeys(payload.images, sid, { kinds: ["images"] }) : [];
+  const video = payload.type === "video" && payload.video
+    ? assertOwnUploadKeys([payload.video], sid, { kinds: ["videos"] })[0]
+    : undefined;
+
+  // Until a job links the two people, contact details are hidden.
+  let content = payload.content;
+  let masked = false;
+  if (payload.type === "text" && content && otherId && !(await hasJobBetween(sid, otherId))) {
+    const m = maskContactInfo(content);
+    content = m.text;
+    masked = m.masked;
   }
 
   const message = await ChatRepository.createMessage({
     conversation: conversationId as any,
     sender: sid as any,
     type: payload.type as MessageType,
-    content: payload.content,
-    images: payload.images || [],
-    video: payload.video,
+    content,
+    images,
+    video,
+    masked,
     readBy: [{ userId: sid as any, readAt: new Date() }],
   });
 
-  await ChatRepository.updateConversationLastMessage(
-    conversationId,
-    message._id,
-    sid,
-  );
+  await ChatRepository.updateConversationLastMessage(conversationId, message._id, sid);
 
-  const populated = (
-    await (message as any).populate("sender", "name avatar")
-  ).toObject();
-
+  const populated = (await (message as any).populate("sender", "name avatar")).toObject();
   const resolved = resolveMessageUrls(populated);
 
-  // Push to the other participant (skip self)
-  const otherId = getOtherParticipantId(conversation, sid);
+  // Push to the other participant (skipped while they are looking at this very chat).
   if (otherId) {
-    const senderName = (resolved.sender as any)?.name || "Someone";
+    const recipient = await UserRepository.findById(otherId, { select: "locale" });
+    const senderName = (resolved.sender as any)?.name || textFor("chat.someone", recipient?.locale).body;
     let body: string;
     if (payload.type === "text") {
-      body = payload.content || "New message";
+      body = content || "…";
     } else if (payload.type === "image") {
-      body = "Sent a photo";
+      body = textFor("chat.photo", recipient?.locale).body;
     } else {
-      body = "Sent a video";
+      body = textFor("chat.video", recipient?.locale).body;
     }
     if (body.length > 80) body = `${body.slice(0, 80)}…`;
 
-    notifyUser(otherId, senderName, body, {
-      type: "chat_message",
-      conversationId: String(conversationId),
-      messageId: String(message._id),
-      senderId: sid,
-    }).catch(() => {});
+    notifyUser(
+      otherId,
+      senderName,
+      body,
+      {
+        type: "chat_message",
+        conversationId: String(conversationId),
+        messageId: String(message._id),
+        senderId: sid,
+      },
+      { skipPushIfInConversation: String(conversationId) },
+    ).catch(() => undefined);
   }
 
   return resolved;
 };
 
-// ─── Send Offer ────────────────────────────────────────
+// ─── Offers ────────────────────────────────────────────
+/** Amounts of an offer, computed on the server with the same rules as a normal job. */
+const buildOfferFinancials = async (input: {
+  priceType: "fixed" | "hourly";
+  price: number;
+  startTime?: string | null;
+  endTime?: string | null;
+  paymentMethod: PaymentMethod;
+  helperCategory: unknown;
+}) => {
+  const pricing = computePricing({
+    priceType: input.priceType,
+    amount: input.price,
+    startTime: input.startTime,
+    endTime: input.endTime,
+  });
+
+  const settings = await SettingsService.getSettings();
+  const minAmount = Number(settings?.minimumServiceAmount) || 0;
+  if (minAmount > 0 && pricing.total < minAmount) {
+    throw new AppError(StatusCodes.BAD_REQUEST, `Minimum job budget is ${minAmount} MAD`, {
+      code: "MIN_BUDGET",
+      params: { min: minAmount },
+    });
+  }
+  if (input.priceType === "hourly") {
+    await CategoryService.assertMinHourlyRate(input.helperCategory, input.price);
+  }
+
+  const feePct = await SettingsService.getFeePercentage();
+  const commission = input.paymentMethod === PaymentMethod.CASH ? commissionFor(pricing.total, feePct) : 0;
+  return {
+    ...pricing,
+    feePercentage: feePct,
+    commission,
+    helperNet: helperNetFor(pricing.total, feePct),
+  };
+};
+
+const assertApprovedHelper = (user: any) => {
+  if (
+    !user ||
+    user.helperApplicationStatus !== "approved" ||
+    user.isBlocked ||
+    user.isDeleted ||
+    (user.auth as any)?.isBlacklisted
+  ) {
+    throw new AppError(StatusCodes.FORBIDDEN, "Only approved helpers can send offers", {
+      code: "NOT_APPROVED",
+    });
+  }
+  if (!user.serviceType) {
+    throw new AppError(
+      StatusCodes.BAD_REQUEST,
+      "Helper must set a service type before sending offers. Update your profile first.",
+      { code: "NO_SERVICE_TYPE" },
+    );
+  }
+};
+
+const offerExpiry = () => new Date(Date.now() + OFFER_TTL_HOURS * 3_600_000);
+
 const sendOffer = async (
   conversationId: string,
   senderId: string,
@@ -369,52 +510,51 @@ const sendOffer = async (
   if (!conversation) {
     throw new AppError(StatusCodes.NOT_FOUND, "Conversation not found");
   }
+  assertParticipant(conversation, sid);
+  assertNotBlocked(conversation);
 
-  const isParticipant = conversation.participants.some(
-    (p: any) => String(p._id) === sid,
-  );
-  if (!isParticipant) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "You are not a participant in this conversation",
-    );
+  const senderUser = await UserRepository.findById(sid, { populate: "auth" });
+  assertApprovedHelper(senderUser);
+
+  // The offer must go to a client, never to another helper.
+  const receiverId = getOtherParticipantId(conversation, sid);
+  const receiver = receiverId ? await UserRepository.findById(receiverId, { populate: "auth" }) : null;
+  if (!receiver || receiver.isBlocked || receiver.isDeleted || (receiver.auth as any)?.role !== "user") {
+    throw new AppError(StatusCodes.FORBIDDEN, "Offers can only be sent to clients", {
+      code: "RECEIVER_NOT_CLIENT",
+    });
   }
 
-  const senderUser = await UserRepository.findById(sid);
-  if (!senderUser?.serviceType) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Helper must set a service type before sending offers. Update your profile first.",
-    );
+  // Too many open offers lock too much of the helper's balance.
+  if ((await ChatRepository.countOpenOffersBySender(sid)) >= MAX_OPEN_OFFERS_PER_HELPER) {
+    throw new AppError(StatusCodes.CONFLICT, "You have too many open offers. Wait for answers or cancel some.", {
+      code: "TOO_MANY_OPEN_OFFERS",
+      params: { max: MAX_OPEN_OFFERS_PER_HELPER },
+    });
   }
 
-  const paymentMethod =
-    (payload.paymentMethod as PaymentMethod) || PaymentMethod.CASH;
+  const paymentMethod = (payload.paymentMethod as PaymentMethod) || PaymentMethod.CASH;
+  const priceType = (payload.priceType || "fixed") as "fixed" | "hourly";
 
-  const { commission } = await calculateOfferBudgetAndCommission({
+  const fin = await buildOfferFinancials({
+    priceType,
     price: payload.price,
-    priceType: payload.priceType,
     startTime: payload.startTime,
     endTime: payload.endTime,
     paymentMethod,
+    helperCategory: senderUser!.serviceType,
   });
 
-  const offerMessageId = new Types.ObjectId();
-  const { WalletRepository } = await import("module/wallet/wallet.repository");
+  const schedule = buildSchedule(payload.date, payload.startTime, payload.endTime);
+  assertScheduleNotPast(payload.date, schedule);
 
-  if (paymentMethod === PaymentMethod.CASH && commission > 0) {
-    try {
-      await WalletRepository.deductCommission(
-        sid,
-        commission,
-        `offer_${offerMessageId}`,
-      );
-    } catch (err: any) {
-      throw new AppError(
-        StatusCodes.BAD_REQUEST,
-        err.message || `Insufficient wallet balance to send offer. Required commission: ${commission} MAD.`,
-      );
-    }
+  const images = assertOwnUploadKeys(payload.images, sid, { kinds: ["images"] });
+
+  const offerMessageId = new Types.ObjectId();
+
+  if (paymentMethod === PaymentMethod.CASH && fin.commission > 0) {
+    // The commission is held from the helper's balance until the offer is answered or expires.
+    await WalletRepository.deductCommission(sid, fin.commission, `offer_${offerMessageId}`);
   }
 
   let message: any;
@@ -428,83 +568,68 @@ const sendOffer = async (
         title: payload.title,
         description: payload.description || "",
         price: payload.price,
-        priceType: (payload.priceType as PriceType) || PriceType.FIXED,
-        date: payload.date || "",
+        priceType: priceType as PriceType,
+        date: payload.date,
         startTime: payload.startTime || "",
         endTime: payload.endTime || "",
-        address: payload.address || "",
-        location:
-          payload.longitude != null && payload.latitude != null
-            ? {
-                type: "Point",
-                coordinates: [payload.longitude, payload.latitude],
-              }
-            : undefined,
+        address: payload.address,
+        location: { type: "Point", coordinates: [payload.longitude, payload.latitude] },
         paymentMethod,
-        images: payload.images || [],
+        images,
         status: OfferStatus.PENDING,
-        commissionDeducted: commission,
+        commissionDeducted: fin.commission,
+        version: 1,
+        totalAmount: fin.total,
+        hourlyRate: fin.hourlyRate,
+        hours: fin.hours,
+        feePercentage: fin.feePercentage,
+        helperNet: fin.helperNet,
+        expiresAt: offerExpiry(),
       },
       readBy: [{ userId: sid as any, readAt: new Date() }],
     });
   } catch (err) {
-    if (paymentMethod === PaymentMethod.CASH && commission > 0) {
-      try {
-        await WalletRepository.refundCommission(
-          sid,
-          commission,
-          `offer_${offerMessageId}`,
-        );
-      } catch (_) {}
+    if (paymentMethod === PaymentMethod.CASH && fin.commission > 0) {
+      await WalletRepository.refundCommission(sid, fin.commission, `offer_${offerMessageId}`).catch(() => undefined);
     }
     throw err;
   }
 
-  await ChatRepository.updateConversationLastMessage(
-    conversationId,
-    message._id,
-    sid,
-  );
+  await ChatRepository.updateConversationLastMessage(conversationId, message._id, sid);
 
-  const populated = (
-    await (message as any).populate("sender", "name avatar")
-  ).toObject();
-
+  const populated = (await (message as any).populate("sender", "name avatar")).toObject();
   const resolved = resolveMessageUrls(populated);
 
-  const otherId = getOtherParticipantId(conversation, sid);
-  if (otherId) {
-    const senderName = (resolved.sender as any)?.name || "Someone";
-    notifyUser(
-      otherId,
-      "New offer",
-      `${senderName} sent an offer: ${payload.title} (${payload.price} MAD)`,
+  if (receiverId) {
+    notifyUserT(
+      receiverId,
+      "offer.new",
+      {
+        name: (resolved.sender as any)?.name || "",
+        title: payload.title,
+        price: fin.total,
+      },
       {
         type: "chat_offer",
         conversationId: String(conversationId),
         messageId: String(message._id),
         senderId: sid,
       },
-    ).catch(() => {});
+      { skipPushIfInConversation: String(conversationId) },
+    ).catch(() => undefined);
   }
 
   return resolved;
 };
 
-// ─── Accept Offer ──────────────────────────────────────
 /**
- * Emit offer status change to conversation room + peer user room.
- * Shared by accept / reject / cancel / edit so live UI stays in sync.
+ * Emit an offer status change to the conversation room + the peer's user room.
+ * Offers use their own event (`chat:offer-update`) — they are not re-sent as new
+ * chat messages, which used to draw duplicate bubbles on apps that do not de-duplicate.
  */
-const emitOfferUpdated = async (
-  conversationId: string,
-  actorId: string,
-  message: any,
-) => {
+const emitOfferUpdated = async (conversationId: string, actorId: string, message: any) => {
   try {
-    const { emitToConversation, emitToUser } = await import(
-      "../../socket/socket.gateway"
-    );
+    const { emitToConversation, emitToUser } = await import("../../socket/socket.gateway");
     const payload = {
       conversationId: String(conversationId),
       messageId: String(message._id),
@@ -513,14 +638,10 @@ const emitOfferUpdated = async (
       message,
     };
     emitToConversation(conversationId, "chat:offer-update", payload);
-    emitToConversation(conversationId, "chat:receive", message);
 
     const conversation = await ChatRepository.findConversationById(conversationId);
-    const other = (conversation?.participants || []).find(
-      (p: any) => String(p._id ?? p) !== String(actorId),
-    );
-    if (other) {
-      const otherId = String(other._id ?? other);
+    const otherId = conversation ? getOtherParticipantId(conversation, String(actorId)) : null;
+    if (otherId) {
       emitToUser(otherId, "chat:offer-update", payload);
       emitToUser(otherId, "chat:conversation_updated", {
         conversationId: String(conversationId),
@@ -532,107 +653,125 @@ const emitOfferUpdated = async (
   }
 };
 
-// ─── Accept Offer ──────────────────────────────────────
-const acceptOffer = async (
-  conversationId: string,
-  userId: string,
-  offerMessageId: string,
-) => {
-  const uid = String(userId);
-
-  // Unstick abandoned online checkouts so the offer can be retried
+/** A payment session that is still open for this offer (the client may be paying right now). */
+const hasLivePayment = async (offerId: string): Promise<boolean> => {
   try {
-    await ChatRepository.expireStuckAwaitingPayment(24);
-  } catch (_) {}
+    const { PaymentTransaction } = await import("../payment/payment.model");
+    return Boolean(
+      await PaymentTransaction.exists({
+        orderId: offerId,
+        status: "pending",
+        createdAt: { $gte: new Date(Date.now() - PAYMENT_LOCK_MINUTES * 60_000) },
+      } as any),
+    );
+  } catch {
+    return false;
+  }
+};
 
+const loadOffer = async (conversationId: string, userId: string, offerMessageId: string) => {
   const conversation = await ChatRepository.findConversationById(conversationId);
   if (!conversation) {
     throw new AppError(StatusCodes.NOT_FOUND, "Conversation not found");
   }
-
-  const isParticipant = conversation.participants.some(
-    (p: any) => String(p._id) === uid,
-  );
-  if (!isParticipant) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "You are not a participant in this conversation",
-    );
-  }
+  assertParticipant(conversation, userId);
 
   const message = await ChatRepository.findMessageById(offerMessageId);
   if (!message) {
     throw new AppError(StatusCodes.NOT_FOUND, "Offer message not found");
   }
-
   if (String(message.conversation) !== conversationId) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Message does not belong to this conversation",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "Message does not belong to this conversation");
   }
-
   if (message.type !== MessageType.OFFER || !message.offerData) {
     throw new AppError(StatusCodes.BAD_REQUEST, "Message is not an offer");
   }
+  return { conversation, message };
+};
 
-  const isOnline = message.offerData.paymentMethod === PaymentMethod.ONLINE;
-  const isAcceptable = isOnline
-    ? message.offerData.status === OfferStatus.PENDING ||
-      message.offerData.status === OfferStatus.AWAITING_PAYMENT
-    : message.offerData.status === OfferStatus.PENDING;
-
-  if (!isAcceptable) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "This offer is no longer pending",
-    );
+/** Give the helper's held commission back (once — the ledger is idempotent per reference). */
+const releaseOfferCommission = async (message: any) => {
+  const amount = Number(message.offerData?.commissionDeducted) || 0;
+  if (amount <= 0) return;
+  try {
+    await WalletRepository.refundCommission(String(message.sender), amount, `offer_${message._id}`);
+  } catch (err: any) {
+    logger.error(`[CHAT] commission release failed for offer ${message._id}: ${err?.message || err}`);
   }
+};
+
+// ─── Accept Offer ──────────────────────────────────────
+const acceptOffer = async (
+  conversationId: string,
+  userId: string,
+  offerMessageId: string,
+  version: number,
+) => {
+  const uid = String(userId);
+
+  const { conversation, message } = await loadOffer(conversationId, uid, offerMessageId);
+  assertNotBlocked(conversation);
+
+  const offer = message.offerData!;
+  const isOnline = offer.paymentMethod === PaymentMethod.ONLINE;
 
   if (String(message.sender) === uid) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "You cannot accept your own offer",
-    );
+    throw new AppError(StatusCodes.FORBIDDEN, "You cannot accept your own offer");
   }
 
-  const offer = message.offerData;
+  const isAcceptable = isOnline
+    ? offer.status === OfferStatus.PENDING || offer.status === OfferStatus.AWAITING_PAYMENT
+    : offer.status === OfferStatus.PENDING;
+  if (!isAcceptable) {
+    throw new AppError(StatusCodes.BAD_REQUEST, "This offer is no longer pending", { code: "OFFER_NOT_PENDING" });
+  }
 
-  if (offer.paymentMethod === PaymentMethod.ONLINE) {
-    // Allow retry: PENDING first accept, or AWAITING_PAYMENT if user backed out of checkout
-    const canStartPayment =
-      message.offerData.status === OfferStatus.PENDING ||
-      message.offerData.status === OfferStatus.AWAITING_PAYMENT;
-    if (!canStartPayment) {
-      throw new AppError(
-        StatusCodes.BAD_REQUEST,
-        "This offer is no longer pending",
-      );
-    }
+  // The client must accept the exact terms they saw (the helper may have edited since).
+  if ((offer.version || 1) !== version) {
+    throw new AppError(StatusCodes.CONFLICT, "The offer changed — please review it again", {
+      code: "OFFER_CHANGED",
+    });
+  }
 
-    if (message.offerData.status === OfferStatus.PENDING) {
+  if (offer.expiresAt && new Date(offer.expiresAt).getTime() < Date.now()) {
+    await expireOffer(message);
+    throw new AppError(StatusCodes.GONE, "This offer has expired", { code: "OFFER_EXPIRED" });
+  }
+
+  // Both sides must still be allowed to do this job.
+  const [client, helper] = await Promise.all([
+    UserRepository.findById(uid, { populate: "auth" }),
+    UserRepository.findById(String(message.sender), { populate: "auth" }),
+  ]);
+  if (!client || client.isBlocked || client.isDeleted || (client.auth as any)?.role !== "user") {
+    throw new AppError(StatusCodes.FORBIDDEN, "Only a client can accept an offer", { code: "ONLY_CLIENT" });
+  }
+  assertApprovedHelper(helper);
+
+  const schedule = buildSchedule(offer.date, offer.startTime, offer.endTime);
+  assertScheduleNotPast(offer.date, schedule);
+  await assertHelperFreeForSlot(helper!._id, schedule.startAt, schedule.endAt);
+
+  if (isOnline) {
+    // Online: reserve the offer for checkout, then the payment confirms it.
+    if (offer.status === OfferStatus.PENDING) {
       const claimedOnline = await ChatRepository.claimOfferStatus(
         offerMessageId,
         OfferStatus.AWAITING_PAYMENT,
         [OfferStatus.PENDING],
       );
       if (!claimedOnline) {
-        throw new AppError(
-          StatusCodes.BAD_REQUEST,
-          "This offer is no longer pending",
-        );
+        throw new AppError(StatusCodes.BAD_REQUEST, "This offer is no longer pending", { code: "OFFER_NOT_PENDING" });
       }
     }
 
     try {
-      const isHourly = (offer.priceType || "fixed") === "hourly";
-      const amount = isHourly
-        ? calcHourlyTotalMAD(
-            Number(offer.price) || 0,
-            offer.startTime,
-            offer.endTime,
-          )
-        : Math.round(Number(offer.price) || 0);
+      const amount = offer.totalAmount ?? computePricing({
+        priceType: (offer.priceType || "fixed") as "fixed" | "hourly",
+        amount: offer.price,
+        startTime: offer.startTime,
+        endTime: offer.endTime,
+      }).total;
 
       const { PaymentService } = await import("../payment/payment.service");
       const paymentSession = await PaymentService.initializePayment(uid, {
@@ -655,28 +794,18 @@ const acceptOffer = async (
         sessionId: paymentSession.sessionId,
       };
     } catch (err) {
-      // Rollback claim only if we just moved PENDING → AWAITING
-      if (message.offerData.status === OfferStatus.PENDING) {
-        await ChatRepository.claimOfferStatus(
-          offerMessageId,
-          OfferStatus.PENDING,
-          [OfferStatus.AWAITING_PAYMENT],
-        );
+      // Roll back only if we just moved PENDING → AWAITING
+      if (offer.status === OfferStatus.PENDING) {
+        await ChatRepository.claimOfferStatus(offerMessageId, OfferStatus.PENDING, [OfferStatus.AWAITING_PAYMENT]);
       }
       throw err;
     }
   }
 
-  // Cash — claim offer atomically, then create job
-  const claimed = await ChatRepository.updateOfferStatusIfPending(
-    offerMessageId,
-    OfferStatus.ACCEPTED,
-  );
+  // Cash — claim offer atomically, then create the job
+  const claimed = await ChatRepository.updateOfferStatusIfPending(offerMessageId, OfferStatus.ACCEPTED);
   if (!claimed) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "This offer is no longer pending",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "This offer is no longer pending", { code: "OFFER_NOT_PENDING" });
   }
 
   let job: any;
@@ -684,11 +813,8 @@ const acceptOffer = async (
     const offerToUse = (claimed as any)?.offerData || offer;
     job = await createJobFromOffer(offerToUse, String(message.sender), uid, offerMessageId);
   } catch (err) {
-    // Rollback claim so offer is not stuck ACCEPTED without a job
-    await ChatRepository.updateOfferStatus(
-      offerMessageId,
-      OfferStatus.PENDING,
-    );
+    // Roll back the claim so the offer is not stuck ACCEPTED without a job
+    await ChatRepository.updateOfferStatus(offerMessageId, OfferStatus.PENDING);
     throw err;
   }
 
@@ -697,223 +823,113 @@ const acceptOffer = async (
     OfferStatus.ACCEPTED,
     String(job._id),
   );
-
   if (acceptedMessage) {
     await emitOfferUpdated(conversationId, uid, acceptedMessage);
   }
 
-  notifyUser(
+  notifyUserT(
     String(message.sender),
-    "Offer accepted",
-    `Your offer "${offer.title}" was accepted. A job was created.`,
+    "offer.accepted",
+    { title: offer.title },
     {
       type: "offer_accepted",
       conversationId: String(conversationId),
       offerMessageId: String(offerMessageId),
       jobId: String(job._id),
     },
-  ).catch(() => {});
+  ).catch(() => undefined);
 
   return { status: "accepted", jobId: job._id, paymentRequired: false };
 };
 
 // ─── Reject Offer ──────────────────────────────────────
-const rejectOffer = async (
-  conversationId: string,
-  userId: string,
-  offerMessageId: string,
-) => {
+const rejectOffer = async (conversationId: string, userId: string, offerMessageId: string) => {
   const uid = String(userId);
-
-  const conversation = await ChatRepository.findConversationById(conversationId);
-  if (!conversation) {
-    throw new AppError(StatusCodes.NOT_FOUND, "Conversation not found");
-  }
-
-  const isParticipant = conversation.participants.some(
-    (p: any) => String(p._id) === uid,
-  );
-  if (!isParticipant) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "You are not a participant in this conversation",
-    );
-  }
-
-  const message = await ChatRepository.findMessageById(offerMessageId);
-  if (!message) {
-    throw new AppError(StatusCodes.NOT_FOUND, "Offer message not found");
-  }
-
-  if (String(message.conversation) !== conversationId) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Message does not belong to this conversation",
-    );
-  }
-
-  if (message.type !== MessageType.OFFER || !message.offerData) {
-    throw new AppError(StatusCodes.BAD_REQUEST, "Message is not an offer");
-  }
+  const { message } = await loadOffer(conversationId, uid, offerMessageId);
 
   if (
-    message.offerData.status !== OfferStatus.PENDING &&
-    message.offerData.status !== OfferStatus.AWAITING_PAYMENT
+    message.offerData!.status !== OfferStatus.PENDING &&
+    message.offerData!.status !== OfferStatus.AWAITING_PAYMENT
   ) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "This offer is no longer pending",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "This offer is no longer pending", { code: "OFFER_NOT_PENDING" });
   }
-
   if (String(message.sender) === uid) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "You cannot reject your own offer",
-    );
+    throw new AppError(StatusCodes.FORBIDDEN, "You cannot reject your own offer");
+  }
+  if (message.offerData!.status === OfferStatus.AWAITING_PAYMENT && (await hasLivePayment(offerMessageId))) {
+    throw new AppError(StatusCodes.CONFLICT, "A payment for this offer is in progress", {
+      code: "PAYMENT_IN_PROGRESS",
+    });
   }
 
-  const rejected = await ChatRepository.claimOfferStatus(
-    offerMessageId,
-    OfferStatus.REJECTED,
-    [OfferStatus.PENDING, OfferStatus.AWAITING_PAYMENT],
-  );
+  const rejected = await ChatRepository.claimOfferStatus(offerMessageId, OfferStatus.REJECTED, [
+    OfferStatus.PENDING,
+    OfferStatus.AWAITING_PAYMENT,
+  ]);
   if (!rejected) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "This offer is no longer pending",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "This offer is no longer pending", { code: "OFFER_NOT_PENDING" });
   }
 
   await emitOfferUpdated(conversationId, uid, rejected);
+  await releaseOfferCommission(message);
 
-  // Refund helper's commission if it was deducted upfront
-  const rejectCommissionToRefund = Number(message.offerData?.commissionDeducted) || 0;
-  if (rejectCommissionToRefund > 0) {
-    try {
-      const { WalletRepository } = await import("module/wallet/wallet.repository");
-      await WalletRepository.refundCommission(
-        String(message.sender),
-        rejectCommissionToRefund,
-        `offer_${offerMessageId}`,
-      );
-    } catch (err: any) {
-      console.error("[CHAT] Failed to refund commission on rejectOffer:", err?.message);
-    }
-  }
-
-  notifyUser(
+  notifyUserT(
     String(message.sender),
-    "Offer rejected",
-    `Your offer "${message.offerData?.title || "offer"}" was rejected.`,
+    "offer.rejected",
+    { title: message.offerData?.title || "" },
     {
       type: "offer_rejected",
       conversationId: String(conversationId),
       offerMessageId: String(offerMessageId),
     },
-  ).catch(() => {});
+  ).catch(() => undefined);
 
   return { status: "rejected" };
 };
 
 // ─── Cancel Offer (Helper only, before acceptance) ─────
-const cancelOffer = async (
-  conversationId: string,
-  userId: string,
-  offerMessageId: string,
-) => {
+const cancelOffer = async (conversationId: string, userId: string, offerMessageId: string) => {
   const uid = String(userId);
-
-  const conversation = await ChatRepository.findConversationById(conversationId);
-  if (!conversation) {
-    throw new AppError(StatusCodes.NOT_FOUND, "Conversation not found");
-  }
-
-  const isParticipant = conversation.participants.some(
-    (p: any) => String(p._id) === uid,
-  );
-  if (!isParticipant) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "You are not a participant in this conversation",
-    );
-  }
-
-  const message = await ChatRepository.findMessageById(offerMessageId);
-  if (!message) {
-    throw new AppError(StatusCodes.NOT_FOUND, "Offer message not found");
-  }
-
-  if (String(message.conversation) !== conversationId) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Message does not belong to this conversation",
-    );
-  }
-
-  if (message.type !== MessageType.OFFER || !message.offerData) {
-    throw new AppError(StatusCodes.BAD_REQUEST, "Message is not an offer");
-  }
+  const { conversation, message } = await loadOffer(conversationId, uid, offerMessageId);
 
   if (
-    message.offerData.status !== OfferStatus.PENDING &&
-    message.offerData.status !== OfferStatus.AWAITING_PAYMENT
+    message.offerData!.status !== OfferStatus.PENDING &&
+    message.offerData!.status !== OfferStatus.AWAITING_PAYMENT
   ) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "This offer is no longer pending",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "This offer is no longer pending", { code: "OFFER_NOT_PENDING" });
   }
-
   if (String(message.sender) !== uid) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "Only the offer sender can cancel",
-    );
+    throw new AppError(StatusCodes.FORBIDDEN, "Only the offer sender can cancel");
+  }
+  if (message.offerData!.status === OfferStatus.AWAITING_PAYMENT && (await hasLivePayment(offerMessageId))) {
+    throw new AppError(StatusCodes.CONFLICT, "A payment for this offer is in progress", {
+      code: "PAYMENT_IN_PROGRESS",
+    });
   }
 
-  const cancelled = await ChatRepository.claimOfferStatus(
-    offerMessageId,
-    OfferStatus.CANCELLED,
-    [OfferStatus.PENDING, OfferStatus.AWAITING_PAYMENT],
-  );
+  const cancelled = await ChatRepository.claimOfferStatus(offerMessageId, OfferStatus.CANCELLED, [
+    OfferStatus.PENDING,
+    OfferStatus.AWAITING_PAYMENT,
+  ]);
   if (!cancelled) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "This offer is no longer pending",
-    );
+    throw new AppError(StatusCodes.BAD_REQUEST, "This offer is no longer pending", { code: "OFFER_NOT_PENDING" });
   }
 
-  // Refund helper's commission if it was deducted upfront
-  const cancelCommissionToRefund = Number(message.offerData?.commissionDeducted) || 0;
-  if (cancelCommissionToRefund > 0) {
-    try {
-      const { WalletRepository } = await import("module/wallet/wallet.repository");
-      await WalletRepository.refundCommission(
-        String(message.sender),
-        cancelCommissionToRefund,
-        `offer_${offerMessageId}`,
-      );
-    } catch (err: any) {
-      console.error("[CHAT] Failed to refund commission on cancelOffer:", err?.message);
-    }
-  }
-
+  await releaseOfferCommission(message);
   await emitOfferUpdated(conversationId, uid, cancelled);
 
-  // Notify the other participant (the client who would have accepted)
   const otherId = getOtherParticipantId(conversation, uid);
   if (otherId) {
-    notifyUser(
+    notifyUserT(
       otherId,
-      "Offer cancelled",
-      `An offer "${message.offerData?.title || "offer"}" was cancelled by the helper.`,
+      "offer.cancelled",
+      { title: message.offerData?.title || "" },
       {
         type: "offer_cancelled",
         conversationId: String(conversationId),
         offerMessageId: String(offerMessageId),
       },
-    ).catch(() => {});
+    ).catch(() => undefined);
   }
 
   return { status: "cancelled" };
@@ -927,184 +943,130 @@ const editOffer = async (
   payload: TEditOfferPayload,
 ) => {
   const uid = String(userId);
+  const { conversation, message } = await loadOffer(conversationId, uid, offerMessageId);
+  assertNotBlocked(conversation);
 
-  const conversation = await ChatRepository.findConversationById(conversationId);
-  if (!conversation) {
-    throw new AppError(StatusCodes.NOT_FOUND, "Conversation not found");
+  if (message.offerData!.status !== OfferStatus.PENDING) {
+    throw new AppError(StatusCodes.BAD_REQUEST, "This offer is no longer pending", { code: "OFFER_NOT_PENDING" });
   }
-
-  const isParticipant = conversation.participants.some(
-    (p: any) => String(p._id) === uid,
-  );
-  if (!isParticipant) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "You are not a participant in this conversation",
-    );
-  }
-
-  const message = await ChatRepository.findMessageById(offerMessageId);
-  if (!message) {
-    throw new AppError(StatusCodes.NOT_FOUND, "Offer message not found");
-  }
-
-  if (String(message.conversation) !== conversationId) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Message does not belong to this conversation",
-    );
-  }
-
-  if (message.type !== MessageType.OFFER || !message.offerData) {
-    throw new AppError(StatusCodes.BAD_REQUEST, "Message is not an offer");
-  }
-
-  if (message.offerData.status !== OfferStatus.PENDING) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "This offer is no longer pending",
-    );
-  }
-
   if (String(message.sender) !== uid) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "Only the offer sender can edit",
-    );
+    throw new AppError(StatusCodes.FORBIDDEN, "Only the offer sender can edit");
   }
 
-  const oldOffer = message.offerData;
-  const oldCommission = Number(oldOffer.commissionDeducted) || 0;
+  const senderUser = await UserRepository.findById(uid, { populate: "auth" });
+  assertApprovedHelper(senderUser);
 
-  const effectivePrice = payload.price != null ? payload.price : oldOffer.price;
-  const effectivePriceType = payload.priceType != null ? payload.priceType : oldOffer.priceType;
-  const effectiveStartTime = payload.startTime != null ? payload.startTime : oldOffer.startTime;
-  const effectiveEndTime = payload.endTime != null ? payload.endTime : oldOffer.endTime;
-  const timeError = validateTimeRange(effectiveStartTime, effectiveEndTime);
-  if (timeError) throw new AppError(StatusCodes.BAD_REQUEST, timeError);
-  const effectivePaymentMethod = (payload.paymentMethod != null ? payload.paymentMethod : oldOffer.paymentMethod) as PaymentMethod;
+  const old = message.offerData!;
+  const oldCommission = Number(old.commissionDeducted) || 0;
+  const oldVersion = old.version || 1;
+  const newVersion = oldVersion + 1;
 
-  const { commission: newCommission } = await calculateOfferBudgetAndCommission({
-    price: effectivePrice,
-    priceType: effectivePriceType,
-    startTime: effectiveStartTime,
-    endTime: effectiveEndTime,
-    paymentMethod: effectivePaymentMethod,
+  const price = payload.price != null ? payload.price : old.price;
+  const priceType = ((payload.priceType != null ? payload.priceType : old.priceType) || "fixed") as "fixed" | "hourly";
+  const startTime = payload.startTime != null ? payload.startTime : old.startTime;
+  const endTime = payload.endTime != null ? payload.endTime : old.endTime;
+  const date = payload.date != null ? payload.date : old.date;
+  const paymentMethod = (payload.paymentMethod != null ? payload.paymentMethod : old.paymentMethod) as PaymentMethod;
+
+  const fin = await buildOfferFinancials({
+    priceType,
+    price,
+    startTime,
+    endTime,
+    paymentMethod,
+    helperCategory: senderUser!.serviceType,
   });
 
-  const { WalletRepository } = await import("module/wallet/wallet.repository");
-  const commissionDiff = newCommission - oldCommission;
+  const schedule = buildSchedule(date, startTime, endTime);
+  assertScheduleNotPast(date, schedule);
 
-  if (commissionDiff > 0) {
-    // Price or hours increased / switched to cash: deduct additional commission
-    try {
-      await WalletRepository.deductCommission(
-        uid,
-        commissionDiff,
-        `offer_${offerMessageId}`,
-      );
-    } catch (err: any) {
-      throw new AppError(
-        StatusCodes.BAD_REQUEST,
-        err.message || `Insufficient wallet balance. Additional ${commissionDiff} MAD commission required for this price update.`,
-      );
-    }
-  } else if (commissionDiff < 0) {
-    // Price or hours decreased / switched to online: refund difference back to helper
-    try {
-      await WalletRepository.refundCommission(
-        uid,
-        Math.abs(commissionDiff),
-        `offer_${offerMessageId}`,
-      );
-    } catch (err: any) {
-      console.error("[CHAT] Failed to refund commission difference on editOffer:", err?.message);
-    }
+  const diff = fin.commission - oldCommission;
+  const adjustRef = `offer_${offerMessageId}:v${newVersion}`;
+
+  if (diff > 0) {
+    await WalletRepository.deductCommission(uid, diff, adjustRef);
+  } else if (diff < 0) {
+    await WalletRepository.refundCommission(uid, Math.abs(diff), adjustRef).catch((err) =>
+      logger.error(`[CHAT] commission difference refund failed for offer ${offerMessageId}: ${err?.message || err}`),
+    );
   }
 
-  const update: any = { ...payload };
-  update.commissionDeducted = newCommission;
+  const update: any = {
+    ...(payload.title !== undefined ? { title: payload.title } : {}),
+    ...(payload.description !== undefined ? { description: payload.description } : {}),
+    price,
+    priceType,
+    date,
+    startTime,
+    endTime,
+    ...(payload.address !== undefined ? { address: payload.address } : {}),
+    paymentMethod,
+    commissionDeducted: fin.commission,
+    totalAmount: fin.total,
+    hourlyRate: fin.hourlyRate ?? null,
+    hours: fin.hours ?? null,
+    feePercentage: fin.feePercentage,
+    helperNet: fin.helperNet,
+    expiresAt: offerExpiry(),
+  };
+  if (payload.images !== undefined) {
+    update.images = assertOwnUploadKeys(payload.images, uid, { allowed: old.images || [], kinds: ["images"] });
+  }
   if (payload.longitude != null && payload.latitude != null) {
-    update.location = {
-      type: "Point",
-      coordinates: [payload.longitude, payload.latitude],
-    };
+    update.location = { type: "Point", coordinates: [payload.longitude, payload.latitude] };
   }
-  delete update.longitude;
-  delete update.latitude;
 
   let updated: any;
   try {
-    updated = await ChatRepository.updateOfferData(offerMessageId, update);
+    updated = await ChatRepository.updateOfferData(offerMessageId, update, oldVersion);
     if (!updated) {
-      throw new AppError(
-        StatusCodes.BAD_REQUEST,
-        "This offer is no longer pending",
-      );
+      throw new AppError(StatusCodes.CONFLICT, "The offer changed or is no longer pending", {
+        code: "OFFER_CHANGED",
+      });
     }
   } catch (err) {
-    // Rollback commission adjustment if DB update failed
-    if (commissionDiff > 0) {
-      await WalletRepository.refundCommission(
-        uid,
-        commissionDiff,
-        `offer_${offerMessageId}`,
-      ).catch(() => {});
-    } else if (commissionDiff < 0) {
-      await WalletRepository.deductCommission(
-        uid,
-        Math.abs(commissionDiff),
-        `offer_${offerMessageId}`,
-      ).catch(() => {});
+    // Undo the commission adjustment if the write did not happen
+    if (diff > 0) {
+      await WalletRepository.refundCommission(uid, diff, `${adjustRef}:undo`).catch(() => undefined);
+    } else if (diff < 0) {
+      await WalletRepository.deductCommission(uid, Math.abs(diff), `${adjustRef}:undo`).catch(() => undefined);
     }
     throw err;
   }
 
-  if (updated) {
-    await emitOfferUpdated(conversationId, uid, updated);
-    const otherId = getOtherParticipantId(conversation, uid);
-    if (otherId) {
-      notifyUser(
-        otherId,
-        "Offer updated",
-        `An offer was updated: ${updated.offerData?.title || "offer"} (${updated.offerData?.price ?? ""} MAD)`,
-        {
-          type: "chat_offer",
-          conversationId: String(conversationId),
-          messageId: String(offerMessageId),
-          senderId: uid,
-        },
-      ).catch(() => {});
-    }
+  await emitOfferUpdated(conversationId, uid, updated);
+  const otherId = getOtherParticipantId(conversation, uid);
+  if (otherId) {
+    notifyUserT(
+      otherId,
+      "offer.updated",
+      { title: updated.offerData?.title || "", price: fin.total },
+      {
+        type: "chat_offer",
+        conversationId: String(conversationId),
+        messageId: String(offerMessageId),
+        senderId: uid,
+      },
+      { skipPushIfInConversation: String(conversationId) },
+    ).catch(() => undefined);
   }
   return updated;
 };
 
 // ─── Mark Messages Read ────────────────────────────────
-const markRead = async (
-  conversationId: string,
-  userId: string,
-  messageIds: string[],
-) => {
+const markRead = async (conversationId: string, userId: string, messageIds: string[]) => {
   const uid = String(userId);
 
   const conversation = await ChatRepository.findConversationById(conversationId);
   if (!conversation) {
     throw new AppError(StatusCodes.NOT_FOUND, "Conversation not found");
   }
-  const isParticipant = conversation.participants.some(
-    (p: any) => String(p._id ?? p) === uid,
-  );
-  if (!isParticipant) {
-    throw new AppError(
-      StatusCodes.FORBIDDEN,
-      "You are not a participant in this conversation",
-    );
-  }
+  assertParticipant(conversation, uid);
 
   await ChatRepository.markMessagesRead(conversationId, uid, messageIds);
-  await ChatRepository.markConversationRead(conversationId, uid);
-  return { success: true };
+  const remaining = await ChatRepository.countUnread(conversationId, uid);
+  await ChatRepository.setUnreadCount(conversationId, uid, remaining);
+  return { success: true, unreadCount: remaining };
 };
 
 // ─── Helper: Create Job from Offer ─────────────────────
@@ -1114,115 +1076,80 @@ const createJobFromOffer = async (
   clientId: string,
   offerMessageId?: string,
 ) => {
-  const client = await UserRepository.findById(clientId);
-  const helper = await UserRepository.findById(helperId);
-
-  // Require helper service type so offer jobs land in the correct category
-  const categoryId = helper?.serviceType;
-  if (!categoryId) {
-    throw new AppError(
-      StatusCodes.BAD_REQUEST,
-      "Helper must set a service type before accepting offers. Update your profile first.",
-    );
+  const [client, helper] = await Promise.all([
+    UserRepository.findById(clientId),
+    UserRepository.findById(helperId, { populate: "auth" }),
+  ]);
+  assertApprovedHelper(helper);
+  if (!client || client.isBlocked || client.isDeleted) {
+    throw new AppError(StatusCodes.FORBIDDEN, "The client account is not available");
   }
 
-  // Hourly offers: charge rate × duration, rounded to whole MAD.
-  // Fixed offers: charge offer.price as total.
+  const categoryId = helper!.serviceType;
   const isHourly = (offer.priceType || "fixed") === "hourly";
-  const hoursBilled = isHourly
-    ? parseHoursBetween(offer.startTime, offer.endTime)
-    : null;
-  const totalBudget = isHourly
-    ? calcHourlyTotalMAD(Number(offer.price) || 0, offer.startTime, offer.endTime)
-    : Math.round(Number(offer.price) || 0);
 
-  // Calculate dynamic platform commission from settings
-  let feePct = 20;
-  try {
-    const { SettingsService } = await import("../settings/settings.service");
-    const settings = await SettingsService.getSettings();
-    if (settings?.platformFeePercentage != null) {
-      feePct = settings.platformFeePercentage;
-    }
-  } catch (_) {}
+  // Amounts: use what was fixed when the offer was sent/edited, else recompute.
+  const pricing = offer.totalAmount
+    ? { total: Number(offer.totalAmount), hourlyRate: offer.hourlyRate, hours: offer.hours }
+    : computePricing({
+        priceType: isHourly ? "hourly" : "fixed",
+        amount: Number(offer.price),
+        startTime: offer.startTime,
+        endTime: offer.endTime,
+      });
+  const feePct: number = offer.feePercentage ?? (await SettingsService.getFeePercentage());
+  const schedule = buildSchedule(offer.date, offer.startTime, offer.endTime);
 
   let commission = 0;
   if (offer.paymentMethod === "cash" || offer.paymentMethod === PaymentMethod.CASH) {
     if (offer.commissionDeducted != null) {
-      // Commission was already deducted upfront when helper sent or edited the offer
-      commission = Number(offer.commissionDeducted) || 0;
+      commission = Number(offer.commissionDeducted) || 0; // already held when the offer was sent
     } else {
-      // Fallback for legacy offers created before upfront deduction
-      commission = Math.round(totalBudget * (feePct / 100));
+      commission = commissionFor(pricing.total, feePct); // legacy offers without a held commission
       if (commission > 0) {
-        const { WalletRepository } = await import("module/wallet/wallet.repository");
-        try {
-          await WalletRepository.deductCommission(
-            helperId,
-            commission,
-            offerMessageId ? `offer_${offerMessageId}` : `offer_${Date.now()}`,
-          );
-        } catch (err: any) {
-          throw new AppError(
-            StatusCodes.BAD_REQUEST,
-            err.message || `Failed to deduct ${feePct}% platform commission. Insufficient wallet balance.`
-          );
-        }
+        await WalletRepository.deductCommission(
+          helperId,
+          commission,
+          offerMessageId ? `offer_${offerMessageId}` : `offer_${Date.now()}`,
+        );
       }
     }
   }
 
+  const offerCoords = offer.location?.coordinates;
+  const location =
+    Array.isArray(offerCoords) && offerCoords.length >= 2
+      ? { type: "Point", coordinates: [Number(offerCoords[0]), Number(offerCoords[1])] }
+      : client.location?.coordinates
+        ? { type: "Point", coordinates: client.location.coordinates }
+        : undefined;
+
   const jobData: any = {
     title: offer.title,
     description: offer.description || "",
-    date: offer.date ? new Date(offer.date) : undefined,
-    budget: totalBudget,
+    date: offer.date ? dayToDate(offer.date) : undefined,
+    startTime: offer.startTime || "",
+    endTime: offer.endTime || "",
+    ...(schedule.startAt ? { startAt: schedule.startAt } : {}),
+    ...(schedule.endAt ? { endAt: schedule.endAt } : {}),
+    budget: pricing.total,
     budgetType: offer.priceType || "fixed",
+    ...(pricing.hourlyRate ? { hourlyRate: pricing.hourlyRate, hours: pricing.hours } : {}),
     paymentMethod: offer.paymentMethod || "cash",
     paymentStatus: offer.paymentMethod === "online" ? "paid" : "pending",
     status: JobStatus.IN_PROGRESS,
+    acceptedAt: new Date(),
+    feePercentage: feePct,
+    helperNet: offer.helperNet ?? helperNetFor(pricing.total, feePct),
     postedBy: clientId,
     assignedTo: helperId,
     images: offer.images || [],
-    startTime: offer.startTime || "",
-    endTime: offer.endTime || "",
     commissionDeducted: commission,
     isCustomOffer: true,
+    category: categoryId,
+    address: offer.address || client.address,
+    ...(location ? { location } : {}),
   };
-
-  if (isHourly) {
-    jobData.description = [
-      offer.description || "",
-      `Hourly rate: ${Math.round(Number(offer.price) || 0)} MAD/h` +
-        (hoursBilled ? ` × ${Math.round(hoursBilled * 100) / 100}h = ${totalBudget} MAD` : ""),
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  if (categoryId) {
-    jobData.category = categoryId;
-  }
-
-  // Prefer offer work location (same shape as client post-job).
-  if (offer.address) {
-    jobData.address = offer.address;
-  } else if (client?.address) {
-    jobData.address = client.address;
-  }
-
-  const offerCoords = (offer as any).location?.coordinates;
-  if (Array.isArray(offerCoords) && offerCoords.length >= 2) {
-    jobData.location = {
-      type: "Point",
-      coordinates: [Number(offerCoords[0]), Number(offerCoords[1])],
-    };
-  } else if (client?.location?.coordinates) {
-    jobData.location = {
-      type: "Point",
-      coordinates: client.location.coordinates,
-    };
-  }
 
   let job: any;
   try {
@@ -1230,33 +1157,88 @@ const createJobFromOffer = async (
   } catch (err) {
     // Compensate: return commission only if deducted right here (legacy fallback)
     if (offer.commissionDeducted == null && commission > 0) {
-      try {
-        const { WalletRepository } = await import("module/wallet/wallet.repository");
-        await WalletRepository.refundCommission(
-          helperId,
-          commission,
-          offerMessageId ? `offer_${offerMessageId}` : `offer_${Date.now()}`,
-        );
-      } catch (_) {}
+      await WalletRepository.refundCommission(
+        helperId,
+        commission,
+        offerMessageId ? `offer_${offerMessageId}` : `offer_${Date.now()}`,
+      ).catch(() => undefined);
     }
     throw err;
   }
 
-  JobRepository.appendHistory(job._id, {
+  await JobRepository.appendHistory(job._id, {
     action: "accepted",
     by: helperId,
     byRole: "helper",
     note: offerMessageId
-      ? `Custom offer${commission > 0 ? ` · commission ${commission} MAD` : ""}`
+      ? `Custom offer${commission > 0 ? ` · commission ${commission} MAD (${feePct}%)` : ""}`
       : undefined,
-  }).catch(() => {});
+  }).catch(() => undefined);
 
   return job;
 };
 
+// ─── Offer maintenance (cron / account deletion) ───────
+const expireOffer = async (message: any) => {
+  const expired = await ChatRepository.claimOfferStatus(String(message._id), OfferStatus.EXPIRED, [
+    OfferStatus.PENDING,
+    OfferStatus.AWAITING_PAYMENT,
+  ]);
+  if (!expired) return false;
+  await releaseOfferCommission(message);
+  await emitOfferUpdated(String(message.conversation), String(message.sender), expired);
+  notifyUserT(
+    String(message.sender),
+    "offer.expired",
+    { title: message.offerData?.title || "" },
+    { type: "offer_expired", conversationId: String(message.conversation), offerMessageId: String(message._id) },
+  ).catch(() => undefined);
+  return true;
+};
+
+/** Offers nobody answered in time: close them and return the held commission. */
+export const expireStaleOffers = async (): Promise<number> => {
+  const stale = await ChatRepository.findExpiredOffers(100);
+  let n = 0;
+  for (const m of stale) {
+    try {
+      if (await expireOffer(m)) n++;
+    } catch (err) {
+      logger.warn(`[CRON] expire offer ${m._id} failed: ${err}`);
+    }
+  }
+  return n;
+};
+
+/** Account deletion: withdraw the user's own offers and reject the ones they received. */
+const releaseOffersOfUser = async (userId: string) => {
+  const uid = String(userId);
+  const convs = await Conversation.find({ participants: uid }).select("_id").lean();
+  const open = await Message.find({
+    type: "offer",
+    "offerData.status": { $in: ["pending", "awaiting_payment"] },
+    conversation: { $in: convs.map((c) => c._id) },
+  } as any).limit(500);
+
+  for (const m of open) {
+    const status = String(m.sender) === uid ? OfferStatus.CANCELLED : OfferStatus.REJECTED;
+    const claimed = await ChatRepository.claimOfferStatus(String(m._id), status, [
+      OfferStatus.PENDING,
+      OfferStatus.AWAITING_PAYMENT,
+    ]);
+    if (!claimed) continue;
+    await releaseOfferCommission(m);
+    await emitOfferUpdated(String(m.conversation), uid, claimed);
+  }
+};
+
 export const ChatService = {
   listConversations,
+  getPresence,
+  getUnreadTotal,
   createOrGetConversation,
+  setBlocked,
+  reportConversation,
   getMessages,
   sendMessage,
   sendOffer,
@@ -1266,4 +1248,6 @@ export const ChatService = {
   editOffer,
   markRead,
   createJobFromOffer,
+  releaseOffersOfUser,
+  expireStaleOffers,
 };

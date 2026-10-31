@@ -15,6 +15,8 @@ export enum OfferStatus {
   ACCEPTED = "accepted",
   REJECTED = "rejected",
   CANCELLED = "cancelled",
+  /** Nobody answered in time; the helper's prepaid commission was returned. */
+  EXPIRED = "expired",
 }
 
 export enum PriceType {
@@ -46,6 +48,16 @@ export interface TOfferData {
   status: OfferStatus;
   acceptedJobId?: Types.ObjectId;
   commissionDeducted?: number;
+  /** Bumped on every edit: the client must accept the exact version they saw. */
+  version: number;
+  /** TOTAL in MAD (hourly: rate × hours), computed by the server. */
+  totalAmount?: number;
+  hourlyRate?: number;
+  hours?: number;
+  /** Commission % in force when the offer was sent / last edited. */
+  feePercentage?: number;
+  helperNet?: number;
+  expiresAt?: Date;
 }
 
 export interface TReadBy {
@@ -60,6 +72,10 @@ export interface TConversation {
   lastMessage?: Types.ObjectId;
   lastMessageAt: Date;
   unreadCounts: Map<string, number>;
+  /** Sorted participant ids joined by "_" — one conversation per pair. */
+  participantsKey?: string;
+  /** Users who blocked this conversation (nobody can write while it is non-empty). */
+  blockedBy?: Types.ObjectId[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -74,6 +90,8 @@ export interface TMessage {
   images: string[];
   video?: string;
   offerData?: TOfferData;
+  /** True when phone numbers / links were hidden because no job links the two people yet. */
+  masked?: boolean;
   readBy: TReadBy[];
   createdAt: Date;
 }

@@ -1,6 +1,9 @@
 import { Router } from "express";
 import auth from "@middlewares/auth";
+import validateRequest from "@middlewares/validateRequest";
+import { createContentLimiter } from "@middlewares/security";
 import { DiditController } from "./didit.controller";
+import { DiditDto } from "./didit.dto";
 
 const router = Router();
 
@@ -9,14 +12,14 @@ const router = Router();
  * @desc    Create a new Didit KYC session for helper verification
  * @access  Private (authenticated user)
  */
-router.post("/session", auth(), DiditController.createSession);
+router.post("/session", auth(), createContentLimiter, DiditController.createSession);
 
 /**
  * @route   POST /api/v1/didit/sync
  * @desc    Direct mobile sync to retrieve latest Didit verification decision
  * @access  Private (authenticated user)
  */
-router.post("/sync", auth(), DiditController.syncSession);
+router.post("/sync", auth(), validateRequest(DiditDto.sync), DiditController.syncSession);
 
 /**
  * @route   POST /api/v1/didit/webhook

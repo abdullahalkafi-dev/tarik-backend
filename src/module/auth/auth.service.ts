@@ -4,31 +4,29 @@ import { Types } from "mongoose";
 import { AuthRepository } from "./auth.repository";
 import { UserRepository } from "module/user/user.repository";
 import { TAuth, AuthStatus, AuthProvider, AuthRole } from "./auth.interface";
-import generateOTP from "util/generateOTP";
+import { Session } from "./session.model";
 import createJwtToken from "jwt/createJwtToken";
 import verifyJwtToken from "jwt/verifyJwtToken";
 import config from "config";
 import { resolveUrl } from "util/minio";
 import { Secret } from "jsonwebtoken";
 import redisClient from "redis/redisClient";
-import { emailHelper } from "mail/emailHelper";
-import emailTemplate from "mail/emailTemplate";
 import bcrypt from "bcryptjs";
 import { normalizeMoroccoPhone } from "util/moroccoPhone";
 import { checkAndIncrementOtpRateLimit } from "util/otpRateLimiter";
+import { LoginThrottle } from "util/loginThrottle";
+import { parseDurationMs } from "util/duration";
 import { logger } from "logger/logger";
+import { notifyAdmins } from "util/notifyAdmins";
+import { disconnectUserSockets } from "../../socket/socket.gateway";
 
 const OTP_EXPIRY_SECONDS = 10 * 60; // 10 minutes TTL
-const OTP_KEY_PREFIX = "otp";
 const PHONE_OTP_KEY_PREFIX = "otp:phone";
+// Demo/testing code until the real WhatsApp provider is connected (owner decision 2026-10-27).
 const FIXED_TEST_OTP = "123456";
+const MIN_PASSWORD_LENGTH = 8;
 
-type TRegisterPayload = {
-  email: string;
-  password: string;
-  name: string;
-  role?: string;
-};
+const ADMIN_ROLES: string[] = [AuthRole.ADMIN, AuthRole.STAFF, AuthRole.SUPER_ADMIN];
 
 type TPhoneRegisterPayload = {
   phone: string;
@@ -37,26 +35,49 @@ type TPhoneRegisterPayload = {
   role?: string;
 };
 
-type TGoogleLoginPayload = {
-  email: string;
-  name: string;
-  googleId: string;
-  avatar?: string;
-  role?: string;
-};
+const maskPhone = (phone: string) => (phone.length > 6 ? `${phone.slice(0, 5)}***${phone.slice(-2)}` : "***");
 
-const buildTokenPayload = (auth: TAuth, userId: string) => ({
+const refreshLifetimeMs = () => parseDurationMs(config.jwt.jwt_refresh_expire_in, 30 * 86_400_000);
+
+// ─── Tokens & sessions ──────────────────────────────────
+const buildTokenPayload = (auth: TAuth, userId: string, sid: string) => ({
   userId,
   authId: String(auth._id),
   email: auth.email,
   phone: auth.phone,
   role: auth.role,
   isSuperAdmin: auth.isSuperAdmin,
-  permissions: (auth as any).permissions || ["*"],
+  // Informational only: the API always re-reads role and permissions from the database.
+  permissions: (auth as any).permissions || [],
+  tv: auth.tokenVersion || 0,
+  sid,
 });
 
-const generateTokens = (auth: TAuth, userId: string) => {
-  const payload = buildTokenPayload(auth, userId);
+/**
+ * Create (or extend) the device session and sign a fresh access + refresh pair.
+ * The refresh token is re-issued on every refresh, so an active user stays
+ * logged in while a revoked session or bumped tokenVersion ends it for real.
+ */
+const generateTokens = async (
+  auth: TAuth,
+  userId: string,
+  options: { sid?: string; userAgent?: string } = {},
+) => {
+  const expiresAt = new Date(Date.now() + refreshLifetimeMs());
+  let sid = options.sid;
+
+  if (sid) {
+    await Session.updateOne({ _id: sid }, { $set: { expiresAt, lastUsedAt: new Date() } });
+  } else {
+    const session = await Session.create({
+      auth: auth._id,
+      userAgent: options.userAgent?.slice(0, 300),
+      expiresAt,
+    });
+    sid = String(session._id);
+  }
+
+  const payload = buildTokenPayload(auth, userId, sid);
 
   const accessToken = createJwtToken(
     payload,
@@ -65,7 +86,7 @@ const generateTokens = (auth: TAuth, userId: string) => {
   );
 
   const refreshToken = createJwtToken(
-    payload,
+    { authId: payload.authId, userId, tv: payload.tv, sid },
     config.jwt.jwt_refresh_secret as string,
     config.jwt.jwt_refresh_expire_in,
   );
@@ -73,375 +94,205 @@ const generateTokens = (auth: TAuth, userId: string) => {
   return { accessToken, refreshToken };
 };
 
-const sendOtpEmail = async (email: string, name: string, otp: string, type: "verify" | "reset") => {
-  const template =
-    type === "verify"
-      ? emailTemplate.createAccount({ name, email, otp })
-      : emailTemplate.resetPassword({ name, email, otp, expiresIn: 15 });
-
-  await emailHelper.sendEmail(template);
+const revokeAllSessions = async (authId: string) => {
+  await bumpTokenVersion(authId);
+  await Session.deleteMany({ auth: authId });
 };
 
-const storeOtp = async (email: string, type: string, otp: string) => {
-  const key = `${OTP_KEY_PREFIX}:${email}:${type}`;
-  await redisClient.set(key, otp, OTP_EXPIRY_SECONDS);
+/** Invalidate every token ever issued for this account (they all carry the old version). */
+const bumpTokenVersion = async (authId: string) => {
+  await AuthRepository.updateById(authId, { $inc: { tokenVersion: 1 } });
 };
 
-const verifyStoredOtp = async (email: string, type: string, otp: string): Promise<boolean> => {
-  const key = `${OTP_KEY_PREFIX}:${email}:${type}`;
-  const stored = await redisClient.get(key);
-  if (!stored || stored !== otp) return false;
-  await redisClient.delete(key);
-  return true;
+const assertPasswordStrength = (password: string) => {
+  if (!password || password.length < MIN_PASSWORD_LENGTH) {
+    throw new AppError(
+      StatusCodes.BAD_REQUEST,
+      `Password must be at least ${MIN_PASSWORD_LENGTH} characters`,
+      { code: "PASSWORD_TOO_SHORT", params: { min: MIN_PASSWORD_LENGTH } },
+    );
+  }
 };
 
-// ─── Register ───────────────────────────────────────────
-const register = async (payload: TRegisterPayload) => {
-  const { email, password, name, role } = payload;
-
-  // Check if verified account exists
-  const existingVerified = await AuthRepository.findOne({
-    email,
-    isEmailVerified: true,
-    isDeleted: false,
-  });
-  if (existingVerified) {
-    throw new AppError(StatusCodes.CONFLICT, "Email already registered");
+const assertAccountUsable = (auth: TAuth, user: { isBlocked?: boolean } | null) => {
+  if (auth.isBlacklisted) {
+    throw new AppError(StatusCodes.FORBIDDEN, "This account has been permanently suspended.");
   }
-
-  // Delete any unverified account with same email
-  const existingUnverified = await AuthRepository.findOne({
-    email,
-    isEmailVerified: false,
-    isDeleted: false,
-  });
-  if (existingUnverified) {
-    await UserRepository.deleteMany({ auth: existingUnverified._id });
-    await AuthRepository.deleteById(String(existingUnverified._id));
+  if (auth.status === AuthStatus.SUSPENDED) {
+    throw new AppError(StatusCodes.FORBIDDEN, "This account has been suspended.");
   }
-
-  // Create auth (password hashed by pre-save hook)
-  const auth = await AuthRepository.create({
-    email,
-    password, // will be hashed by pre-save hook
-    role: (role === "helper" ? AuthRole.HELPER : AuthRole.USER) as any,
-    isEmailVerified: false,
-    status: AuthStatus.PENDING,
-  });
-
-  // Create user
-  await UserRepository.create({
-    auth: new Types.ObjectId(auth._id),
-    name,
-    email,
-  });
-
-  // Generate and send OTP
-  const otp = generateOTP();
-  console.log(`[DEV] OTP for ${email}: ${otp}`);
-  await storeOtp(email, "verify", otp);
-  await sendOtpEmail(email, name, otp, "verify");
-
-  return {
-    status: "unverified",
-    email,
-    message: "OTP sent to your email",
-  };
+  if (!user || user.isBlocked) {
+    throw new AppError(StatusCodes.FORBIDDEN, "This account has been suspended.");
+  }
 };
 
-// ─── Verify OTP ─────────────────────────────────────────
-const verifyOtp = async (email: string, otp: string) => {
-  const valid = await verifyStoredOtp(email, "verify", otp);
-  if (!valid) {
-    throw new AppError(StatusCodes.BAD_REQUEST, "Invalid or expired OTP");
-  }
+// ─── Login (e-mail + password: admin / staff only) ─────
+const login = async (
+  payload: { email: string; password: string },
+  meta: { userAgent?: string } = {},
+) => {
+  const email = payload.email.trim().toLowerCase();
+  const { password } = payload;
 
-  const auth = await AuthRepository.findOne({ email, isDeleted: false });
-  if (!auth) {
-    throw new AppError(StatusCodes.NOT_FOUND, "Account not found");
-  }
+  await LoginThrottle.assertNotLocked("email", email);
 
-  if (auth.isEmailVerified) {
-    throw new AppError(StatusCodes.BAD_REQUEST, "Email already verified");
-  }
-
-  // Mark as verified and active
-  await AuthRepository.updateById(String(auth._id), {
-    isEmailVerified: true,
-    status: AuthStatus.ACTIVE,
-  });
-
-  const user = await UserRepository.findOne({ auth: auth._id });
-  if (!user) {
-    throw new AppError(StatusCodes.NOT_FOUND, "Account not found");
-  }
-
-  const tokens = generateTokens(auth, String(user._id));
-
-  return {
-    ...tokens,
-    user: {
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      role: auth.role,
-      status: AuthStatus.ACTIVE,
-    },
-  };
-};
-
-// ─── Resend OTP ─────────────────────────────────────────
-const resendOtp = async (email: string) => {
-  const auth = await AuthRepository.findOne({ email, isDeleted: false });
-  if (!auth) {
-    throw new AppError(StatusCodes.NOT_FOUND, "No account found");
-  }
-
-  if (auth.isEmailVerified) {
-    throw new AppError(StatusCodes.BAD_REQUEST, "Email already verified");
-  }
-
-  const user = await UserRepository.findOne({ auth: auth._id });
-  const name = user?.name || "User";
-
-  const otp = generateOTP();
-  await storeOtp(email, "verify", otp);
-  await sendOtpEmail(email, name, otp, "verify");
-
-  return { message: "OTP resent to your email" };
-};
-
-// ─── Login ──────────────────────────────────────────────
-const login = async (payload: { email: string; password: string }) => {
-  const { email, password } = payload;
-
-  // Find auth with password field
   const auth = await AuthRepository.findOne(
     { email, isDeleted: false },
     { select: "+password" },
   );
 
-  // Hide account existence for unverified accounts
-  if (!auth || !auth.isEmailVerified) {
-    throw new AppError(StatusCodes.UNAUTHORIZED, "No account found");
+  // Same message and same cost for "no such account", "not an admin" and "wrong password".
+  const invalid = new AppError(StatusCodes.UNAUTHORIZED, "Invalid email or password");
+
+  if (!auth || !auth.isEmailVerified || !ADMIN_ROLES.includes(auth.role) || !auth.password) {
+    await bcrypt.compare(password, "$2a$08$invalidinvalidinvalidinvalidinvalidinvalidinvalidinv0");
+    await LoginThrottle.registerFailure("email", email);
+    throw invalid;
   }
 
-  // Compare password
-  const isPasswordValid = await bcrypt.compare(password, auth.password || "");
+  const isPasswordValid = await bcrypt.compare(password, auth.password);
   if (!isPasswordValid) {
-    throw new AppError(StatusCodes.UNAUTHORIZED, "Invalid credentials");
+    await LoginThrottle.registerFailure("email", email);
+    throw invalid;
   }
 
   const user = await UserRepository.findOne({ auth: auth._id });
-  if (!user || user.isBlocked) {
-    throw new AppError(StatusCodes.UNAUTHORIZED, "Account has been blocked");
-  }
+  assertAccountUsable(auth, user);
+  await LoginThrottle.clear("email", email);
 
-  // Update last login
   await AuthRepository.updateById(String(auth._id), { lastLogin: new Date() });
 
-  const tokens = generateTokens(auth, String(user._id));
+  const tokens = await generateTokens(auth, String(user!._id), meta);
 
   return {
     ...tokens,
     user: {
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      avatar: resolveUrl(user.avatar),
+      _id: user!._id,
+      name: user!.name,
+      email: user!.email,
+      avatar: resolveUrl(user!.avatar),
       role: auth.role,
       isSuperAdmin: auth.isSuperAdmin,
-      permissions: (auth as any).permissions || ["*"],
+      permissions: auth.isSuperAdmin ? ["*"] : (auth as any).permissions || [],
       status: auth.status,
-    },
-  };
-};
-
-// ─── Google Login ───────────────────────────────────────
-const googleLogin = async (payload: TGoogleLoginPayload) => {
-  const { email, name, googleId, avatar, role } = payload;
-
-  let auth = await AuthRepository.findOne({ email, isDeleted: false });
-
-  if (auth) {
-    // Existing account - update googleId if needed
-    if (!auth.googleId) {
-      await AuthRepository.updateById(String(auth._id), { googleId });
-    }
-
-    // Auto-verify if not already
-    if (!auth.isEmailVerified) {
-      await AuthRepository.updateById(String(auth._id), {
-        isEmailVerified: true,
-        status: AuthStatus.ACTIVE,
-      });
-    }
-
-    // Update last login
-    await AuthRepository.updateById(String(auth._id), { lastLogin: new Date() });
-
-    const user = await UserRepository.findOne({ auth: auth._id });
-    if (!user) {
-      throw new AppError(StatusCodes.NOT_FOUND, "Account not found");
-    }
-
-    const tokens = generateTokens(auth, String(user._id));
-
-    return {
-      ...tokens,
-      user: {
-        _id: user._id,
-        name: user.name,
-        email: user.email,
-        avatar: resolveUrl(user.avatar),
-        role: auth.role,
-        status: auth.status,
-      },
-    };
-  }
-
-  // New account - create auth + user
-  auth = await AuthRepository.create({
-    email,
-    password: "", // No password for Google users
-    loginProvider: AuthProvider.GOOGLE,
-    googleId,
-    role: (role === "helper" ? AuthRole.HELPER : AuthRole.USER) as any,
-    isEmailVerified: true,
-    status: AuthStatus.ACTIVE,
-  });
-
-  const user = await UserRepository.create({
-    auth: new Types.ObjectId(auth._id),
-    name,
-    email,
-    avatar,
-  });
-
-  const tokens = generateTokens(auth, String(user._id));
-
-  return {
-    ...tokens,
-    user: {
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      avatar: resolveUrl(user.avatar),
-      role: auth.role,
-      status: AuthStatus.ACTIVE,
+      mustChangePassword: !!auth.mustChangePassword,
     },
   };
 };
 
 // ─── Refresh Token ──────────────────────────────────────
-const getAccessToken = async (refreshToken: string) => {
+const getAccessToken = async (refreshToken: string, meta: { userAgent?: string } = {}) => {
   const decoded = verifyJwtToken(refreshToken, config.jwt.jwt_refresh_secret as Secret);
 
   const auth = await AuthRepository.findById(decoded.authId);
-  if (!auth || auth.isDeleted) {
+  if (!auth || auth.isDeleted || auth.isBlacklisted || auth.status === AuthStatus.SUSPENDED) {
     throw new AppError(StatusCodes.UNAUTHORIZED, "Invalid refresh token");
   }
 
+  if ((decoded.tv ?? 0) !== (auth.tokenVersion ?? 0)) {
+    throw new AppError(StatusCodes.UNAUTHORIZED, "Session expired. Please log in again.");
+  }
+
   const user = await UserRepository.findOne({ auth: auth._id });
-  if (!user || user.isBlocked) {
+  if (!user || user.isBlocked || user.isDeleted) {
     throw new AppError(StatusCodes.UNAUTHORIZED, "Invalid refresh token");
   }
 
-  const tokens = generateTokens(auth, String(user._id));
+  let sid: string | undefined;
+  if (decoded.sid) {
+    const session = await Session.findById(decoded.sid);
+    if (!session || String(session.auth) !== String(auth._id)) {
+      throw new AppError(StatusCodes.UNAUTHORIZED, "Session expired. Please log in again.");
+    }
+    sid = String(session._id);
+  }
+  // Tokens issued before sessions existed carry no sid: upgrade them in place.
 
-  return { accessToken: tokens.accessToken };
+  return generateTokens(auth, String(user._id), { sid, userAgent: meta.userAgent });
 };
 
-// ─── Forgot Password ────────────────────────────────────
-const forgotPassword = async (email: string) => {
-  const auth = await AuthRepository.findOne({ email, isDeleted: false, isEmailVerified: true });
-  if (!auth) {
-    // Don't reveal account existence
-    return { message: "If an account exists, an OTP has been sent" };
+// ─── Logout ─────────────────────────────────────────────
+const logout = async (sid?: string) => {
+  if (sid) {
+    await Session.deleteOne({ _id: sid });
   }
-
-  const user = await UserRepository.findOne({ auth: auth._id });
-  const name = user?.name || "User";
-
-  const otp = generateOTP();
-  await storeOtp(email, "reset", otp);
-  await sendOtpEmail(email, name, otp, "reset");
-
-  return { message: "If an account exists, an OTP has been sent" };
+  return { message: "Logged out" };
 };
 
-// ─── Verify Reset OTP ───────────────────────────────────
-const verifyResetOtp = async (email: string, otp: string) => {
-  const valid = await verifyStoredOtp(email, "reset", otp);
-  if (!valid) {
-    throw new AppError(StatusCodes.BAD_REQUEST, "Invalid or expired OTP");
-  }
-
-  const auth = await AuthRepository.findOne({ email, isDeleted: false });
-  if (!auth) {
-    throw new AppError(StatusCodes.NOT_FOUND, "Account not found");
-  }
-
-  // Generate a short-lived reset token
-  const resetToken = createJwtToken(
-    { authId: String(auth._id), type: "password_reset" },
-    config.jwt.jwt_secret as string,
-    "10m",
-  );
-
-  return { resetToken };
+const logoutAll = async (authId: string) => {
+  await revokeAllSessions(authId);
+  return { message: "Logged out from all devices" };
 };
 
-// ─── Reset Password ─────────────────────────────────────
-const resetPassword = async (resetToken: string, newPassword: string) => {
-  const decoded = verifyJwtToken(resetToken, config.jwt.jwt_secret as Secret);
+// ─── Change password (logged-in users and admins) ───────
+const changePassword = async (
+  authId: string,
+  userId: string,
+  currentPassword: string,
+  newPassword: string,
+  meta: { userAgent?: string } = {},
+) => {
+  assertPasswordStrength(newPassword);
 
-  if (decoded.type !== "password_reset") {
-    throw new AppError(StatusCodes.BAD_REQUEST, "Invalid reset token");
-  }
-
-  const auth = await AuthRepository.findById(decoded.authId);
+  const auth = await AuthRepository.findById(authId, { select: "+password" });
   if (!auth || auth.isDeleted) {
     throw new AppError(StatusCodes.NOT_FOUND, "Account not found");
   }
 
-  // Update password (will be hashed by pre-save hook)
-  auth.password = newPassword;
+  const ok = auth.password ? await bcrypt.compare(currentPassword, auth.password) : false;
+  if (!ok) {
+    throw new AppError(StatusCodes.BAD_REQUEST, "Current password is incorrect", {
+      code: "WRONG_CURRENT_PASSWORD",
+    });
+  }
+  if (currentPassword === newPassword) {
+    throw new AppError(StatusCodes.BAD_REQUEST, "The new password must be different", {
+      code: "SAME_PASSWORD",
+    });
+  }
+
+  auth.password = newPassword; // hashed by pre-save hook
+  auth.mustChangePassword = false;
   await auth.save();
 
-  return { message: "Password reset successful" };
+  // Every other device is logged out; this device gets a fresh session.
+  await revokeAllSessions(authId);
+  const fresh = await AuthRepository.findById(authId);
+  const tokens = await generateTokens(fresh as TAuth, userId, meta);
+  disconnectUserSockets(userId);
+
+  return { message: "Password changed successfully", ...tokens };
 };
 
 // ─── Phone OTP Helpers ─────────────────────────────────
 const storePhoneOtp = async (phone: string, type: string, otp: string) => {
   const key = `${PHONE_OTP_KEY_PREFIX}:${phone}:${type}`;
   await redisClient.set(key, otp, OTP_EXPIRY_SECONDS);
-  logger.info(`🔑 [PHONE OTP STORED] key: ${key}, code: ${otp}`);
 };
 
 const verifyStoredPhoneOtp = async (phone: string, type: string, otp: string): Promise<boolean> => {
   const key = `${PHONE_OTP_KEY_PREFIX}:${phone}:${type}`;
   const stored = await redisClient.get(key);
-  logger.info(`🔍 [PHONE OTP VERIFY CHECK] key: ${key}, received: ${otp}, stored: ${stored || 'none'}`);
-  // For simulation / development, accept FIXED_TEST_OTP or stored OTP
+  // Demo mode: the fixed code (or the stored one) is accepted until a real provider exists.
   if (!stored && otp !== FIXED_TEST_OTP) {
-    logger.warn(`❌ [PHONE OTP FAILED] No stored OTP and received does not match test OTP: ${phone}`);
+    logger.warn(`[PHONE OTP] no stored code for ${maskPhone(phone)}`);
     return false;
   }
   if (stored && stored !== otp && otp !== FIXED_TEST_OTP) {
-    logger.warn(`❌ [PHONE OTP MISMATCH] Received: ${otp}, Stored: ${stored} for ${phone}`);
+    logger.warn(`[PHONE OTP] mismatch for ${maskPhone(phone)}`);
     return false;
   }
   await redisClient.delete(key);
-  logger.info(`✅ [PHONE OTP MATCHED] Successfully verified OTP for ${phone}`);
   return true;
 };
 
 // ─── Phone Register ─────────────────────────────────────
 const registerWithPhone = async (payload: TPhoneRegisterPayload) => {
   const normalizedPhone = normalizeMoroccoPhone(payload.phone);
-  const { password, name, role } = payload;
-  logger.info(`📱 [PHONE REGISTER ATTEMPT] raw: ${payload.phone}, normalized: ${normalizedPhone}, role: ${role || 'user'}`);
+  const { password, role } = payload;
+  const name = payload.name.trim();
+  assertPasswordStrength(password);
+  logger.info(`[PHONE REGISTER] ${maskPhone(normalizedPhone)} role=${role || "user"}`);
 
   // 1. Blacklist check
   const blacklisted = await AuthRepository.findOne({
@@ -449,7 +300,6 @@ const registerWithPhone = async (payload: TPhoneRegisterPayload) => {
     isBlacklisted: true,
   });
   if (blacklisted) {
-    logger.warn(`🚫 [PHONE REGISTER BLOCKED] Phone is blacklisted: ${normalizedPhone}`);
     throw new AppError(
       StatusCodes.FORBIDDEN,
       "This phone number has been permanently blacklisted due to security policy violations.",
@@ -463,24 +313,24 @@ const registerWithPhone = async (payload: TPhoneRegisterPayload) => {
     isDeleted: false,
   });
   if (existingVerified) {
-    logger.warn(`⚠️ [PHONE REGISTER CONFLICT] Phone already registered and verified: ${normalizedPhone}`);
-    throw new AppError(StatusCodes.CONFLICT, "Phone number is already registered. Please log in.");
+    throw new AppError(StatusCodes.CONFLICT, "Phone number is already registered. Please log in.", {
+      code: "PHONE_ALREADY_REGISTERED",
+    });
   }
 
-  // 3. Delete unverified account with same phone
+  // 3. Rate limit before touching any data
+  await checkAndIncrementOtpRateLimit(normalizedPhone);
+
+  // 4. Replace an earlier unverified attempt for the same number
   const existingUnverified = await AuthRepository.findOne({
     phone: normalizedPhone,
     isPhoneVerified: false,
     isDeleted: false,
   });
   if (existingUnverified) {
-    logger.info(`🧹 [PHONE REGISTER CLEANUP] Removing previous unverified account for: ${normalizedPhone}`);
     await UserRepository.deleteMany({ auth: existingUnverified._id });
     await AuthRepository.deleteById(String(existingUnverified._id));
   }
-
-  // 4. Rate limit check
-  await checkAndIncrementOtpRateLimit(normalizedPhone);
 
   // 5. Create auth record (password hashed by pre-save hook)
   const auth = await AuthRepository.create({
@@ -499,9 +349,8 @@ const registerWithPhone = async (payload: TPhoneRegisterPayload) => {
     phone: normalizedPhone,
   });
 
-  // 7. Store WhatsApp OTP
+  // 7. Store the verification code (demo: fixed code)
   await storePhoneOtp(normalizedPhone, "verify", FIXED_TEST_OTP);
-  logger.info(`✅ [PHONE REGISTER SUCCESS] Created pending account authId: ${auth._id}, WhatsApp OTP: ${FIXED_TEST_OTP} for ${normalizedPhone}`);
 
   return {
     status: "unverified",
@@ -511,23 +360,22 @@ const registerWithPhone = async (payload: TPhoneRegisterPayload) => {
 };
 
 // ─── Verify Phone OTP ───────────────────────────────────
-const verifyPhoneOtp = async (phone: string, otp: string) => {
+const verifyPhoneOtp = async (phone: string, otp: string, meta: { userAgent?: string } = {}) => {
   const normalizedPhone = normalizeMoroccoPhone(phone);
-  logger.info(`📱 [VERIFY PHONE OTP ATTEMPT] raw: ${phone}, normalized: ${normalizedPhone}, otp: ${otp}`);
-  
+
   const valid = await verifyStoredPhoneOtp(normalizedPhone, "verify", otp);
   if (!valid) {
-    throw new AppError(StatusCodes.BAD_REQUEST, "Invalid or expired WhatsApp OTP code");
+    throw new AppError(StatusCodes.BAD_REQUEST, "Invalid or expired WhatsApp OTP code", {
+      code: "INVALID_OTP",
+    });
   }
 
   const auth = await AuthRepository.findOne({ phone: normalizedPhone, isDeleted: false });
   if (!auth) {
-    logger.error(`❌ [VERIFY PHONE OTP] Account not found in DB for: ${normalizedPhone}`);
     throw new AppError(StatusCodes.NOT_FOUND, "Account not found");
   }
 
   if (auth.isBlacklisted) {
-    logger.warn(`🚫 [VERIFY PHONE OTP] Account blacklisted: ${normalizedPhone}`);
     throw new AppError(StatusCodes.FORBIDDEN, "This account has been permanently blacklisted.");
   }
 
@@ -539,7 +387,6 @@ const verifyPhoneOtp = async (phone: string, otp: string) => {
 
   const user = await UserRepository.findOne({ auth: auth._id });
   if (!user) {
-    logger.error(`❌ [VERIFY PHONE OTP] User profile not found for authId: ${auth._id}`);
     throw new AppError(StatusCodes.NOT_FOUND, "Account not found");
   }
 
@@ -547,8 +394,18 @@ const verifyPhoneOtp = async (phone: string, otp: string) => {
     throw new AppError(StatusCodes.FORBIDDEN, "Account has been suspended");
   }
 
-  const tokens = generateTokens(auth, String(user._id));
-  logger.info(`✅ [VERIFY PHONE OTP SUCCESS] User ${user._id} verified and active with role ${auth.role}`);
+  const tokens = await generateTokens(auth, String(user._id), meta);
+
+  // First verification of this account = a new registration (admin alert, if switched on).
+  if (!auth.isPhoneVerified) {
+    notifyAdmins(
+      "New registration",
+      `${user.name} joined as ${auth.role === AuthRole.HELPER ? "helper" : "client"}`,
+      { type: "new_registration", userId: String(user._id) },
+      "users.view",
+      "newUserRegistrations",
+    ).catch(() => undefined);
+  }
 
   return {
     ...tokens,
@@ -568,10 +425,8 @@ const verifyPhoneOtp = async (phone: string, otp: string) => {
 // ─── Resend Phone OTP ───────────────────────────────────
 const resendPhoneOtp = async (phone: string) => {
   const normalizedPhone = normalizeMoroccoPhone(phone);
-  logger.info(`📱 [RESEND PHONE OTP ATTEMPT] phone: ${normalizedPhone}`);
   const auth = await AuthRepository.findOne({ phone: normalizedPhone, isDeleted: false });
   if (!auth) {
-    logger.warn(`❌ [RESEND PHONE OTP] Account not found: ${normalizedPhone}`);
     throw new AppError(StatusCodes.NOT_FOUND, "No account found");
   }
 
@@ -585,46 +440,52 @@ const resendPhoneOtp = async (phone: string) => {
 
   await checkAndIncrementOtpRateLimit(normalizedPhone);
   await storePhoneOtp(normalizedPhone, "verify", FIXED_TEST_OTP);
-  logger.info(`✅ [RESEND PHONE OTP SUCCESS] Sent OTP ${FIXED_TEST_OTP} to ${normalizedPhone}`);
 
   return { message: "WhatsApp verification code resent" };
 };
 
 // ─── Phone Login ────────────────────────────────────────
-const loginWithPhone = async (payload: { phone: string; password: string; loginAs?: string }) => {
+const loginWithPhone = async (
+  payload: { phone: string; password: string; loginAs?: string },
+  meta: { userAgent?: string } = {},
+) => {
   const normalizedPhone = normalizeMoroccoPhone(payload.phone);
   const { password } = payload;
-  logger.info(`🔐 [PHONE LOGIN ATTEMPT] raw: ${payload.phone}, normalized: ${normalizedPhone}`);
+
+  await LoginThrottle.assertNotLocked("phone", normalizedPhone);
 
   const auth = await AuthRepository.findOne(
     { phone: normalizedPhone, isDeleted: false },
     { select: "+password" },
   );
 
-  if (!auth) {
-    logger.warn(`❌ [PHONE LOGIN FAILED] No active Auth record found in DB for phone: ${normalizedPhone}`);
-    throw new AppError(StatusCodes.UNAUTHORIZED, "Invalid phone number or password");
-  }
+  const invalid = new AppError(StatusCodes.UNAUTHORIZED, "Invalid phone number or password", {
+    code: "INVALID_CREDENTIALS",
+  });
 
-  if (auth.isBlacklisted) {
-    logger.warn(`🚫 [PHONE LOGIN BLOCKED] Account is blacklisted: ${normalizedPhone}`);
-    throw new AppError(StatusCodes.FORBIDDEN, "This account has been permanently suspended.");
+  if (!auth) {
+    // Burn the same time as a real comparison so account existence is not observable.
+    await bcrypt.compare(password, "$2a$08$invalidinvalidinvalidinvalidinvalidinvalidinvalidinv0");
+    await LoginThrottle.registerFailure("phone", normalizedPhone);
+    throw invalid;
   }
 
   const isPasswordValid = await bcrypt.compare(password, auth.password || "");
   if (!isPasswordValid) {
-    logger.warn(`❌ [PHONE LOGIN FAILED] Password mismatch for phone: ${normalizedPhone}`);
-    throw new AppError(StatusCodes.UNAUTHORIZED, "Invalid phone number or password");
+    await LoginThrottle.registerFailure("phone", normalizedPhone);
+    throw invalid;
+  }
+
+  if (auth.isBlacklisted) {
+    throw new AppError(StatusCodes.FORBIDDEN, "This account has been permanently suspended.");
   }
 
   const user = await UserRepository.findOne({ auth: auth._id });
-  if (!user || user.isBlocked) {
-    logger.warn(`🚫 [PHONE LOGIN BLOCKED] User profile suspended or missing for authId: ${auth._id}`);
-    throw new AppError(StatusCodes.FORBIDDEN, "This account has been suspended.");
-  }
+  assertAccountUsable(auth, user);
+  await LoginThrottle.clear("phone", normalizedPhone);
 
   if (!auth.isPhoneVerified) {
-    logger.info(`⚠️ [PHONE LOGIN UNVERIFIED] Account ${auth._id} is unverified. Dispatching OTP.`);
+    await checkAndIncrementOtpRateLimit(normalizedPhone);
     await storePhoneOtp(normalizedPhone, "verify", FIXED_TEST_OTP);
     return {
       status: "unverified",
@@ -636,21 +497,20 @@ const loginWithPhone = async (payload: { phone: string; password: string; loginA
 
   await AuthRepository.updateById(String(auth._id), { lastLogin: new Date() });
 
-  const tokens = generateTokens(auth, String(user._id));
-  logger.info(`✅ [PHONE LOGIN SUCCESS] Logged in authId: ${auth._id}, userId: ${user._id}, role: ${auth.role}`);
+  const tokens = await generateTokens(auth, String(user!._id), meta);
 
   return {
     ...tokens,
     user: {
-      _id: user._id,
-      name: user.name,
-      phone: user.phone,
-      email: user.email,
-      avatar: resolveUrl(user.avatar),
+      _id: user!._id,
+      name: user!.name,
+      phone: user!.phone,
+      email: user!.email,
+      avatar: resolveUrl(user!.avatar),
       role: auth.role,
       status: auth.status,
       isPhoneVerified: true,
-      helperApplicationStatus: user.helperApplicationStatus,
+      helperApplicationStatus: user!.helperApplicationStatus,
     },
   };
 };
@@ -658,21 +518,20 @@ const loginWithPhone = async (payload: { phone: string; password: string; loginA
 // ─── Forgot Password (Phone) ────────────────────────────
 const forgotPasswordPhone = async (phone: string) => {
   const normalizedPhone = normalizeMoroccoPhone(phone);
-  logger.info(`🔑 [FORGOT PASSWORD PHONE ATTEMPT] raw: ${phone}, normalized: ${normalizedPhone}`);
+
+  // The limit applies to every number, registered or not, so the response
+  // pattern never reveals whether an account exists.
+  await checkAndIncrementOtpRateLimit(normalizedPhone);
+
   const auth = await AuthRepository.findOne({
     phone: normalizedPhone,
     isDeleted: false,
     isPhoneVerified: true,
   });
 
-  if (!auth) {
-    logger.warn(`⚠️ [FORGOT PASSWORD PHONE] No verified account found with phone: ${normalizedPhone}. Returning generic security response.`);
-    return { message: "If an account exists, a WhatsApp reset code has been sent." };
+  if (auth) {
+    await storePhoneOtp(normalizedPhone, "reset", FIXED_TEST_OTP);
   }
-
-  await checkAndIncrementOtpRateLimit(normalizedPhone);
-  await storePhoneOtp(normalizedPhone, "reset", FIXED_TEST_OTP);
-  logger.info(`✅ [FORGOT PASSWORD PHONE SUCCESS] Stored reset OTP ${FIXED_TEST_OTP} for ${normalizedPhone}`);
 
   return { message: "If an account exists, a WhatsApp reset code has been sent." };
 };
@@ -680,24 +539,25 @@ const forgotPasswordPhone = async (phone: string) => {
 // ─── Verify Reset OTP (Phone) ───────────────────────────
 const verifyResetOtpPhone = async (phone: string, otp: string) => {
   const normalizedPhone = normalizeMoroccoPhone(phone);
-  logger.info(`🔑 [VERIFY RESET OTP PHONE ATTEMPT] phone: ${normalizedPhone}, otp: ${otp}`);
   const valid = await verifyStoredPhoneOtp(normalizedPhone, "reset", otp);
   if (!valid) {
-    throw new AppError(StatusCodes.BAD_REQUEST, "Invalid or expired reset OTP code");
+    throw new AppError(StatusCodes.BAD_REQUEST, "Invalid or expired reset OTP code", {
+      code: "INVALID_OTP",
+    });
   }
 
   const auth = await AuthRepository.findOne({ phone: normalizedPhone, isDeleted: false });
   if (!auth) {
-    logger.error(`❌ [VERIFY RESET OTP PHONE] Account not found in DB for: ${normalizedPhone}`);
     throw new AppError(StatusCodes.NOT_FOUND, "Account not found");
   }
 
+  // The reset token is bound to the current tokenVersion: it dies as soon as the
+  // password is changed (single use) or any other revocation event happens.
   const resetToken = createJwtToken(
-    { authId: String(auth._id), phone: auth.phone, type: "password_reset" },
+    { authId: String(auth._id), phone: auth.phone, type: "password_reset", tv: auth.tokenVersion || 0 },
     config.jwt.jwt_secret as string,
     "10m",
   );
-  logger.info(`✅ [VERIFY RESET OTP PHONE SUCCESS] Generated reset token for authId: ${auth._id}`);
 
   return { resetToken };
 };
@@ -709,30 +569,37 @@ const resetPasswordPhone = async (resetToken: string, newPassword: string) => {
   if (decoded.type !== "password_reset") {
     throw new AppError(StatusCodes.BAD_REQUEST, "Invalid reset token");
   }
+  assertPasswordStrength(newPassword);
 
   const auth = await AuthRepository.findById(decoded.authId);
   if (!auth || auth.isDeleted) {
-    logger.error(`❌ [RESET PASSWORD PHONE] Account not found for authId: ${decoded.authId}`);
     throw new AppError(StatusCodes.NOT_FOUND, "Account not found");
+  }
+
+  if ((decoded.tv ?? 0) !== (auth.tokenVersion ?? 0)) {
+    throw new AppError(StatusCodes.BAD_REQUEST, "This reset link has already been used or has expired", {
+      code: "RESET_TOKEN_USED",
+    });
   }
 
   auth.password = newPassword;
   await auth.save();
-  logger.info(`✅ [RESET PASSWORD PHONE SUCCESS] Password updated for authId: ${auth._id}`);
+
+  // Single use + every old session ends.
+  await revokeAllSessions(String(auth._id));
+  if (auth.phone) await LoginThrottle.clear("phone", auth.phone);
+  const user = await UserRepository.findOne({ auth: auth._id });
+  if (user) disconnectUserSockets(String(user._id));
 
   return { message: "Password reset successful" };
 };
 
 export const AuthService = {
-  register,
-  verifyOtp,
-  resendOtp,
   login,
-  googleLogin,
   getAccessToken,
-  forgotPassword,
-  verifyResetOtp,
-  resetPassword,
+  logout,
+  logoutAll,
+  changePassword,
   // Phone auth
   registerWithPhone,
   verifyPhoneOtp,
@@ -742,3 +609,5 @@ export const AuthService = {
   verifyResetOtpPhone,
   resetPasswordPhone,
 };
+
+export { revokeAllSessions, generateTokens };

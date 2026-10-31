@@ -1,24 +1,27 @@
 import { Router } from "express";
-import auth from "@middlewares/auth";
+import auth, { requirePermission } from "@middlewares/auth";
 import validateRequest from "@middlewares/validateRequest";
 import { CategoryController } from "./category.controller";
 import { CategoryDto } from "./category.dto";
 
 const router = Router();
 
+const staff = auth("admin", "superAdmin", "staff");
+const canEdit = requirePermission("categories.manage");
+
 /**
  * @route   GET /api/v1/categories
- * @desc    Get all active categories
+ * @desc    Get all active categories (names in ?lang= / Accept-Language)
  * @access  Public
  */
 router.get("/", CategoryController.getAll);
 
 /**
  * @route   GET /api/v1/categories/all
- * @desc    Get all categories (admin)
- * @access  Private (Admin)
+ * @desc    Get all categories including inactive (admin)
+ * @access  Private (staff)
  */
-router.get("/all", auth("admin", "superAdmin"), CategoryController.getAllAdmin);
+router.get("/all", staff, CategoryController.getAllAdmin);
 
 /**
  * @route   GET /api/v1/categories/:id
@@ -30,36 +33,22 @@ router.get("/:id", CategoryController.getById);
 /**
  * @route   POST /api/v1/categories
  * @desc    Create a category
- * @access  Private (Admin)
+ * @access  Private (staff, categories.manage)
  */
-router.post(
-  "/",
-  auth("admin", "superAdmin"),
-  validateRequest(CategoryDto.create),
-  CategoryController.create,
-);
+router.post("/", staff, canEdit, validateRequest(CategoryDto.create), CategoryController.create);
 
 /**
  * @route   PATCH /api/v1/categories/:id
  * @desc    Update a category
- * @access  Private (Admin)
+ * @access  Private (staff, categories.manage)
  */
-router.patch(
-  "/:id",
-  auth("admin", "superAdmin"),
-  validateRequest(CategoryDto.update),
-  CategoryController.update,
-);
+router.patch("/:id", staff, canEdit, validateRequest(CategoryDto.update), CategoryController.update);
 
 /**
  * @route   DELETE /api/v1/categories/:id
- * @desc    Delete a category
- * @access  Private (Admin)
+ * @desc    Delete an UNUSED category (used ones must be deactivated instead)
+ * @access  Private (staff, categories.manage)
  */
-router.delete(
-  "/:id",
-  auth("admin", "superAdmin"),
-  CategoryController.remove,
-);
+router.delete("/:id", staff, canEdit, CategoryController.remove);
 
 export const CategoryRoutes = router;

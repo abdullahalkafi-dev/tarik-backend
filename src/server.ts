@@ -10,7 +10,16 @@ import { syncAuthIndexes } from "module/auth/auth.model";
 import { closeSocketServer, initializeSocketServer } from "./socket";
 import { ensureBucket } from "./util/minio";
 import { runSeed } from "./db/seed";
-import { startExpirePendingPaymentJobs } from "./jobs/expirePendingPaymentJobs";
+import { startMaintenanceJobs } from "./jobs/maintenance";
+import { ChatRepository } from "./module/chat/chat.repository";
+import { Conversation } from "./module/chat/conversation.model";
+import { Message } from "./module/chat/message.model";
+import { Session } from "./module/auth/session.model";
+import { WalletTransactionLedger } from "./module/wallet/walletTransaction.model";
+import { Job } from "./module/job/job.model";
+import { Category } from "./module/category/category.model";
+import { SupportTicket } from "./module/support/support.model";
+import { AppNotification } from "./module/notification/notification.model";
 
 const server = http.createServer(app);
 
@@ -21,9 +30,36 @@ async function main() {
     // 1. Connect MongoDB
     await ConnectDB();
 
-    // 2. Ensure indexes
-    await syncUserIndexes();
-    await syncAuthIndexes();
+    // 2. Ensure indexes. One index that cannot be built (for example a new unique
+    //    index while old duplicate data still exists) must be reported loudly but
+    //    must never stop the API from starting.
+    const indexJobs: [string, () => Promise<unknown>][] = [
+      ["users", syncUserIndexes],
+      ["auths", syncAuthIndexes],
+      ["sessions", () => Session.init()],
+      ["conversations", () => Conversation.init()],
+      ["messages", () => Message.init()],
+      ["wallet ledger", () => WalletTransactionLedger.init()],
+      ["jobs", () => Job.init()],
+      ["categories", () => Category.init()],
+      ["support tickets", () => SupportTicket.init()],
+      ["notifications", () => AppNotification.init()],
+    ];
+    for (const [label, run] of indexJobs) {
+      try {
+        await run();
+      } catch (error) {
+        errorLogger.error(`Index build failed for ${label} — fix the data and restart`, {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    try {
+      const keyed = await ChatRepository.backfillConversationKeys();
+      if (keyed) logger.info(`Backfilled pair keys on ${keyed} conversation(s)`);
+    } catch (error) {
+      logger.warn(`Conversation key backfill skipped: ${error instanceof Error ? error.message : error}`);
+    }
 
     // 3. Seed admin/test data — never let a seed failure take the API down
     try {
@@ -59,7 +95,7 @@ async function main() {
 
     // 6. Background jobs
     try {
-      startExpirePendingPaymentJobs();
+      startMaintenanceJobs();
     } catch (err) {
       logger.warn(`Failed to start cron jobs: ${err}`);
     }
@@ -136,12 +172,13 @@ process.on("uncaughtException", (error: Error) => {
   setTimeout(() => process.exit(1), 1000);
 });
 
+// A single rejected promise (for example a socket handler during a Redis
+// hiccup) must not take the whole API down for every user: log and continue.
 process.on("unhandledRejection", (reason: unknown) => {
   errorLogger.error("Unhandled Rejection", {
     reason: reason instanceof Error ? reason.message : String(reason),
     stack: reason instanceof Error ? reason.stack : undefined,
   });
-  setTimeout(() => process.exit(1), 1000);
 });
 
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));

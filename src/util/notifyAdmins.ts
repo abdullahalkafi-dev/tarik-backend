@@ -4,105 +4,78 @@ import { sendFCMMulticast } from "./firebase";
 import { logger } from "logger/logger";
 import { NotificationRepository } from "module/notification/notification.repository";
 import { NotificationAudience } from "module/notification/notification.interface";
+import { SettingsService } from "module/settings/settings.service";
+
+export type AdminAlertSetting = "newUserRegistrations" | "successfulPayments" | "customerServiceTickets";
 
 /**
- * Fire-and-forget push to all admin / superAdmin / staff device tokens.
- * Persists one in-app notification per admin user (dashboard bell).
- * Note: FCM only reaches admins who logged into the **mobile app** (have deviceToken).
+ * Fire-and-forget alert to the admin team: one in-app notification per admin
+ * (dashboard bell) plus a push to every device of the admins who are logged
+ * into the mobile app.
+ *
+ * `permission` limits the alert to staff who actually handle that area
+ * (Super Admins and holders of "*" always get it).
  */
 export const notifyAdmins = async (
   title: string,
   body: string,
   data?: Record<string, string>,
+  permission?: string,
+  /** The Settings → Notifications switch that controls this kind of alert. */
+  settingKey?: AdminAlertSetting,
 ): Promise<void> => {
   try {
-    // $ne: true matches false OR missing (legacy docs without the field).
-    // Also match isSuperAdmin in case role string drifted.
+    if (settingKey) {
+      const settings: any = await SettingsService.getSettings();
+      if (settings?.notifications?.[settingKey] === false) return;
+    }
+
     const adminAuths = await Auth.find({
-      $or: [
-        { role: { $in: ["admin", "superAdmin", "staff"] } },
-        { isSuperAdmin: true },
-      ],
+      $or: [{ role: { $in: ["admin", "superAdmin", "staff"] } }, { isSuperAdmin: true }],
       isDeleted: { $ne: true },
       isBlacklisted: { $ne: true },
+      status: { $ne: "suspended" },
     } as any)
-      .select("_id role isSuperAdmin")
+      .select("_id role isSuperAdmin permissions")
       .lean();
 
-    logger.info("[FCM] notifyAdmins start", {
-      title,
-      adminAuthCount: adminAuths.length,
+    const eligible = adminAuths.filter((a: any) => {
+      if (!permission) return true;
+      if (a.isSuperAdmin) return true;
+      const perms: string[] = a.permissions || [];
+      return perms.includes("*") || perms.includes(permission);
     });
 
-    if (!adminAuths.length) {
-      try {
-        const total = await Auth.countDocuments({});
-        const sample = await Auth.find({})
-          .select("role isSuperAdmin isDeleted isBlacklisted")
-          .limit(10)
-          .lean();
-        logger.warn("[FCM] notifyAdmins — no admin/staff auth docs", {
-          totalAuthDocs: total,
-          sample,
-        });
-      } catch (dbgErr) {
-        logger.warn("[FCM] notifyAdmins — no admin/staff auth docs");
-      }
+    if (!eligible.length) {
+      logger.warn("[FCM] notifyAdmins — no eligible admin accounts", { permission });
       return;
     }
 
-    const authIds = adminAuths.map((a: any) => a._id);
-    // All admin/staff user docs (for in-app history), not only those with FCM tokens
-    const allAdminUsers = await UserRepository.findMany(
+    const admins = await UserRepository.findMany(
       {
-        auth: { $in: authIds },
+        auth: { $in: eligible.map((a: any) => a._id) },
         isBlocked: { $ne: true },
         isDeleted: { $ne: true },
       } as any,
       { limit: 50 },
     );
 
-    if (!allAdminUsers.length) {
-      logger.warn(
-        "[FCM] notifyAdmins — admin auths found but no linked User docs",
-        { authIds: authIds.map(String) },
-      );
-      return;
-    }
-
-    for (const adminUser of allAdminUsers) {
+    for (const adminUser of admins) {
       NotificationRepository.create({
         user: (adminUser as any)._id,
         audience: NotificationAudience.ADMIN,
         title,
         body,
         data: data || {},
-      }).catch(() => {});
+      }).catch(() => undefined);
     }
 
-    const users = allAdminUsers.filter((u: any) => u.deviceToken);
-    const tokens = users
-      .map((u: any) => u.deviceToken)
-      .filter(Boolean) as string[];
-
-    logger.info("[FCM] notifyAdmins tokens", {
-      adminUsersFound: allAdminUsers.length,
-      tokenCount: tokens.length,
-    });
-
-    if (!tokens.length) {
-      logger.warn(
-        "[FCM] notifyAdmins skipped push — no admin deviceToken (in-app history still saved)",
-      );
-      return;
-    }
+    const tokens = Array.from(
+      new Set(admins.flatMap((u: any) => UserRepository.tokensOf(u))),
+    );
+    if (!tokens.length) return;
 
     const { invalidTokens } = await sendFCMMulticast(tokens, title, body, data);
-    logger.info("[FCM] notifyAdmins sent", {
-      sent: tokens.length,
-      invalid: invalidTokens.length,
-      title,
-    });
     for (const dead of invalidTokens) {
       await UserRepository.clearDeviceTokenByValue(dead);
     }

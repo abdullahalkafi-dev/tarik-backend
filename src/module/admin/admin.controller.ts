@@ -8,6 +8,7 @@ const listHelperApplications = catchAsync(async (req, res) => {
     req.query.status as string | undefined,
     Number(req.query.page) || 1,
     Number(req.query.limit) || 20,
+    req.query.search as string | undefined,
   );
 
   sendResponse(res, {
@@ -34,6 +35,7 @@ const listUsers = catchAsync(async (req, res) => {
     Number(req.query.page) || 1,
     Number(req.query.limit) || 20,
     req.query.search as string | undefined,
+    req.query.status as "active" | "blocked" | undefined,
   );
 
   sendResponse(res, {
@@ -117,12 +119,42 @@ const unbanHelper = catchAsync(async (req, res) => {
 });
 
 const blockUser = catchAsync(async (req, res) => {
-  const result = await AdminService.blockUser(req.params.userId as string);
+  const result = await AdminService.blockUser(
+    req.params.userId as string,
+    req.user?._id as string,
+    req.body.reason,
+  );
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
     success: true,
-    message: "User block status toggled",
+    message: "User blocked",
+    data: result,
+  });
+});
+
+const unblockUser = catchAsync(async (req, res) => {
+  const result = await AdminService.unblockUser(
+    req.params.userId as string,
+    req.user?._id as string,
+    req.body?.reason,
+  );
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "User unblocked",
+    data: result,
+  });
+});
+
+const getHelperContact = catchAsync(async (req, res) => {
+  const result = await AdminService.getHelperContact(req.params.userId as string, req.user?._id as string);
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Contact details",
     data: result,
   });
 });
@@ -262,8 +294,11 @@ const getJobCancellations = catchAsync(async (req, res) => {
   });
 });
 
-const getLiveHelperLocations = catchAsync(async (_req, res) => {
-  const result = await AdminService.getLiveHelperLocations();
+const getLiveHelperLocations = catchAsync(async (req, res) => {
+  const result = await AdminService.getLiveHelperLocations({
+    liveOnly: req.query.liveOnly === "true",
+    limit: Number(req.query.limit) || undefined,
+  });
   sendResponse(res, {
     statusCode: StatusCodes.OK,
     success: true,
@@ -282,6 +317,8 @@ export const AdminController = {
   permanentBanHelper,
   unbanHelper,
   blockUser,
+  unblockUser,
+  getHelperContact,
   getStats,
   // Staff Management
   getAdminProfile,

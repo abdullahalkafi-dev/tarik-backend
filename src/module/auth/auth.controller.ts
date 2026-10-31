@@ -1,54 +1,18 @@
 import { StatusCodes } from "http-status-codes";
+import { Request } from "express";
 import catchAsync from "@shared/catchAsync";
 import sendResponse from "@shared/sendResponse";
 import { AuthService } from "./auth.service";
 
-const register = catchAsync(async (req, res) => {
-  const result = await AuthService.register(req.body);
+const clientMeta = (req: Request) => ({ userAgent: req.get("user-agent") || undefined });
 
-  sendResponse(res, {
-    statusCode: StatusCodes.CREATED,
-    success: true,
-    message: result.message,
-    data: { status: result.status, email: result.email },
-  });
-});
-
-const verifyOtp = catchAsync(async (req, res) => {
-  const result = await AuthService.verifyOtp(req.body.email, req.body.otp);
-
-  sendResponse(res, {
-    statusCode: StatusCodes.OK,
-    success: true,
-    message: "Email verified successfully",
-    data: result,
-  });
-});
-
-const resendOtp = catchAsync(async (req, res) => {
-  const result = await AuthService.resendOtp(req.body.email);
-
-  sendResponse(res, {
-    statusCode: StatusCodes.OK,
-    success: true,
-    message: result.message,
-    data: null,
-  });
-});
+const authIdOf = (req: Request): string => {
+  const user = req.user as any;
+  return String(user?.auth?._id || user?.auth);
+};
 
 const login = catchAsync(async (req, res) => {
-  const result = await AuthService.login(req.body);
-
-  sendResponse(res, {
-    statusCode: StatusCodes.OK,
-    success: true,
-    message: "Login successful",
-    data: result,
-  });
-});
-
-const googleLogin = catchAsync(async (req, res) => {
-  const result = await AuthService.googleLogin(req.body);
+  const result = await AuthService.login(req.body, clientMeta(req));
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -59,7 +23,7 @@ const googleLogin = catchAsync(async (req, res) => {
 });
 
 const getAccessToken = catchAsync(async (req, res) => {
-  const result = await AuthService.getAccessToken(req.body.refreshToken);
+  const result = await AuthService.getAccessToken(req.body.refreshToken, clientMeta(req));
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -69,8 +33,8 @@ const getAccessToken = catchAsync(async (req, res) => {
   });
 });
 
-const forgotPassword = catchAsync(async (req, res) => {
-  const result = await AuthService.forgotPassword(req.body.email);
+const logout = catchAsync(async (req, res) => {
+  const result = await AuthService.logout((req.user as any)?.sessionId);
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -80,25 +44,31 @@ const forgotPassword = catchAsync(async (req, res) => {
   });
 });
 
-const verifyResetOtp = catchAsync(async (req, res) => {
-  const result = await AuthService.verifyResetOtp(req.body.email, req.body.otp);
-
-  sendResponse(res, {
-    statusCode: StatusCodes.OK,
-    success: true,
-    message: "OTP verified",
-    data: result,
-  });
-});
-
-const resetPassword = catchAsync(async (req, res) => {
-  const result = await AuthService.resetPassword(req.body.resetToken, req.body.newPassword);
+const logoutAll = catchAsync(async (req, res) => {
+  const result = await AuthService.logoutAll(authIdOf(req));
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
     success: true,
     message: result.message,
     data: null,
+  });
+});
+
+const changePassword = catchAsync(async (req, res) => {
+  const result = await AuthService.changePassword(
+    authIdOf(req),
+    String((req.user as any)._id),
+    req.body.currentPassword,
+    req.body.newPassword,
+    clientMeta(req),
+  );
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: result.message,
+    data: { accessToken: result.accessToken, refreshToken: result.refreshToken },
   });
 });
 
@@ -114,7 +84,7 @@ const registerWithPhone = catchAsync(async (req, res) => {
 });
 
 const verifyPhoneOtp = catchAsync(async (req, res) => {
-  const result = await AuthService.verifyPhoneOtp(req.body.phone, req.body.otp);
+  const result = await AuthService.verifyPhoneOtp(req.body.phone, req.body.otp, clientMeta(req));
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
@@ -136,12 +106,12 @@ const resendPhoneOtp = catchAsync(async (req, res) => {
 });
 
 const loginWithPhone = catchAsync(async (req, res) => {
-  const result = await AuthService.loginWithPhone(req.body);
+  const result = await AuthService.loginWithPhone(req.body, clientMeta(req));
 
   sendResponse(res, {
     statusCode: StatusCodes.OK,
     success: true,
-    message: result.message || "Login successful",
+    message: (result as { message?: string }).message || "Login successful",
     data: result,
   });
 });
@@ -180,15 +150,11 @@ const resetPasswordPhone = catchAsync(async (req, res) => {
 });
 
 export const AuthController = {
-  register,
-  verifyOtp,
-  resendOtp,
   login,
-  googleLogin,
   getAccessToken,
-  forgotPassword,
-  verifyResetOtp,
-  resetPassword,
+  logout,
+  logoutAll,
+  changePassword,
   // Phone auth
   registerWithPhone,
   verifyPhoneOtp,

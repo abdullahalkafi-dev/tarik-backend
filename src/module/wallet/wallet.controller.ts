@@ -18,7 +18,8 @@ const listTransactions = catchAsync(async (req, res) => {
   const result = await WalletService.listTransactions(
     req.user?._id as string,
     Number(req.query.page) || 1,
-    Number(req.query.limit) || 20,
+    Math.min(Number(req.query.limit) || 20, 100),
+    typeof req.query.type === "string" && /^[a-z_]{1,30}$/.test(req.query.type) ? req.query.type : undefined,
   );
 
   sendResponse(res, {

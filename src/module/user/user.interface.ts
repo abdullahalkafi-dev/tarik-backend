@@ -54,6 +54,29 @@ export interface TUser {
   deviceToken?: string | null;
   deviceTokenPlatform?: "android" | "ios";
   deviceTokenUpdatedAt?: Date;
+  /** Every device the user is logged in on (push goes to all of them). */
+  deviceTokens?: { token: string; platform: "android" | "ios"; updatedAt: Date }[];
+  /** Language of the app (ar | fr | en | es) so the server can write push texts in it. */
+  locale?: string;
+  notificationPrefs?: {
+    push: boolean;
+    sound: boolean;
+    vibrate: boolean;
+    payments: boolean;
+    appUpdates: boolean;
+    newService: boolean;
+  };
+  /** Helper availability: only available helpers are shown as "available now" and notified. */
+  isAvailable?: boolean;
+  /** Last GPS position reported by the helper app (rate-limited), used to rank nearby jobs. */
+  lastKnownLocation?: TUserLocation;
+  lastKnownLocationAt?: Date;
+  /** Terms/privacy version the user accepted. */
+  acceptedLegalVersion?: number;
+  acceptedLegalAt?: Date;
+  /** Cancellation strikes for the cancellation policy. */
+  cancelStrikes?: number;
+  cancelStrikeUntil?: Date;
 
   // Helper fields
   isHelperFormSubmitted: boolean;
@@ -81,8 +104,13 @@ export interface TUser {
     livenessScore?: number;
     livenessPassed?: boolean;
     ocrName?: string;
+    dateOfBirth?: string;
+    documentExpiry?: string;
+    issuingCountry?: string;
+    nameMatchScore?: number;
     warnings?: string[];
   };
+  diditSessionCount?: number;
   documentNumberHash?: string;
   maskedDocumentNumber?: string;
 
@@ -97,6 +125,8 @@ export interface TUser {
 
   isDeleted: boolean;
   isBlocked: boolean;
+  blockedReason?: string;
+  blockedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }

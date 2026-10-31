@@ -68,7 +68,9 @@ describe("CategoryService", () => {
       expect(CategoryRepository.exists).toHaveBeenCalledWith({
         name: "Plumbing",
       });
-      expect(CategoryRepository.create).toHaveBeenCalledWith(payload);
+      expect(CategoryRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "Plumbing", slug: "plumbing", names: { en: "Plumbing" } }),
+      );
       expect(cacheService.invalidateByPattern).toHaveBeenCalled();
     });
 
@@ -94,7 +96,9 @@ describe("CategoryService", () => {
 
       const result = await CategoryService.getAll();
 
-      expect(result).toEqual(categories);
+      expect(result).toEqual([
+        expect.objectContaining({ _id: categoryId, name: "Plumbing", displayName: "Plumbing" }),
+      ]);
       expect(cacheService.getOrSet).toHaveBeenCalledWith(
         "test:cache:key",
         expect.any(Function),
@@ -111,7 +115,7 @@ describe("CategoryService", () => {
 
       const result = await CategoryService.getById(categoryId);
 
-      expect(result).toEqual(category);
+      expect(result).toEqual(expect.objectContaining({ _id: categoryId, name: "Plumbing" }));
       expect(CategoryRepository.findById).toHaveBeenCalledWith(categoryId);
     });
 
@@ -190,7 +194,35 @@ describe("CategoryService", () => {
     });
   });
 
+  describe("displayName (CA-02)", () => {
+    it("uses the caller's language and falls back to English", async () => {
+      cacheService.getOrSet.mockResolvedValue([
+        { _id: categoryId, name: "Home Cleaning", names: { en: "Home Cleaning", fr: "Ménage à domicile" } },
+      ]);
+      const fr = await CategoryService.getAll("fr");
+      const ar = await CategoryService.getAll("ar");
+      expect(fr[0].displayName).toBe("Ménage à domicile");
+      expect(ar[0].displayName).toBe("Home Cleaning");
+    });
+  });
+
   describe("remove", () => {
+    it("refuses to delete a category that jobs still use (CA-01)", async () => {
+      const { Job } = require("module/job/job.model");
+      await Job.create({
+        title: "Clean flat",
+        budget: 100,
+        postedBy: new mongoose.Types.ObjectId(),
+        category: categoryId,
+      });
+
+      await expect(CategoryService.remove(categoryId)).rejects.toMatchObject({
+        statusCode: 409,
+        code: "CATEGORY_IN_USE",
+      });
+      expect(CategoryRepository.deleteById).not.toHaveBeenCalled();
+    });
+
     it("should delete a category", async () => {
       const category = { _id: categoryId, name: "Plumbing" };
 

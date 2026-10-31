@@ -30,6 +30,5 @@ const walletSchema = new Schema<TWallet>(
   { timestamps: true }
 );
 
-walletSchema.index({ user: 1 }, { unique: true });
 
 export const Wallet = model<TWallet>("Wallet", walletSchema);

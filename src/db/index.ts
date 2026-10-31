@@ -5,13 +5,8 @@ import { logger } from "../logger/logger";
 const ConnectDB = async () => {
   mongoose.set("strictQuery", true);
 
-  mongoose.plugin((schema: unknown) => {
-    const s = schema as { pre: (event: string, fn: () => void) => void };
-    const setRunValidators = () => ({ runValidators: true });
-    s.pre("findOneAndUpdate", setRunValidators);
-    s.pre("updateMany", setRunValidators);
-    s.pre("updateOne", setRunValidators);
-  });
+  // Schema validators (min/max/enum…) also run on update queries, not only on save().
+  mongoose.set("runValidators", true);
 
   const maxPoolSize = Number(config.database.max_pool_size) || 10;
 

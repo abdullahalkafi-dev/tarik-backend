@@ -1,32 +1,42 @@
 import { Types } from "mongoose";
-import { Conversation } from "./conversation.model";
+import { Conversation, conversationKey } from "./conversation.model";
 import { Message } from "./message.model";
 import { TConversation, TMessage, OfferStatus } from "./chat.interface";
 import { resolveUrl } from "../../util/minio";
 
 // ─── Conversation Repository ───────────────────────────
+const populateConversation = (id: string | Types.ObjectId) =>
+  Conversation.findById(id).populate("participants", "name avatar").populate("lastMessage");
+
 const createConversation = async (
   participantIds: string[],
 ): Promise<TConversation> => {
   const objectIds = participantIds.map((id) => new Types.ObjectId(id));
+  const key = conversationKey(participantIds);
 
-  // 1. Try to find existing conversation with exactly these participants
-  let conversation = await Conversation.findOne({
-    participants: { $all: objectIds, $size: objectIds.length },
-  });
+  // 1. One conversation per pair: look it up by the pair key, then by members (older rows).
+  let conversation =
+    (await Conversation.findOne({ participantsKey: key })) ||
+    (await Conversation.findOne({
+      participants: { $all: objectIds, $size: objectIds.length },
+    }));
 
-  // 2. If not found, create new one
+  if (conversation && !conversation.participantsKey) {
+    await Conversation.updateOne({ _id: conversation._id }, { $set: { participantsKey: key } }).catch(
+      () => undefined,
+    );
+  }
+
+  // 2. If not found, create a new one (the unique key makes a double tap harmless)
   if (!conversation) {
     try {
       conversation = await Conversation.create({
         participants: objectIds,
+        participantsKey: key,
         unreadCounts: {},
       });
     } catch (err: any) {
-      // Race condition or existing conversation
-      conversation = await Conversation.findOne({
-        participants: { $all: objectIds, $size: objectIds.length },
-      });
+      conversation = await Conversation.findOne({ participantsKey: key });
       if (!conversation) {
         throw err;
       }
@@ -34,26 +44,53 @@ const createConversation = async (
   }
 
   // Populate participants so Flutter can read name/avatar
-  const populated = await Conversation.findById(conversation._id)
-    .populate("participants", "name avatar")
-    .populate("lastMessage");
+  const populated = await populateConversation(conversation._id);
 
   return (populated || conversation) as TConversation;
+};
+
+/** Give every old conversation its pair key (run once at start-up). */
+const backfillConversationKeys = async (): Promise<number> => {
+  const missing = await Conversation.find({ participantsKey: { $exists: false } })
+    .select("participants")
+    .limit(5000)
+    .lean();
+  let n = 0;
+  const seen = new Set<string>();
+  for (const c of missing) {
+    const key = conversationKey((c.participants || []).map(String));
+    if (seen.has(key) || (await Conversation.exists({ participantsKey: key }))) continue; // duplicate pair: leave without key
+    seen.add(key);
+    await Conversation.updateOne({ _id: c._id }, { $set: { participantsKey: key } });
+    n++;
+  }
+  return n;
 };
 
 const findConversationById = async (
   conversationId: string,
 ): Promise<TConversation | null> => {
-  return Conversation.findById(conversationId)
-    .populate("participants", "name avatar")
-    .populate("lastMessage");
+  return populateConversation(conversationId);
 };
 
-const findUserConversations = async (userId: string) => {
-  return Conversation.find({ participants: userId })
+const findUserConversations = async (
+  userId: string,
+  options: { limit?: number; before?: string } = {},
+) => {
+  const filter: any = {
+    participants: userId,
+    // A conversation shows up in the inbox once somebody wrote something.
+    lastMessage: { $ne: null },
+  };
+  if (options.before) {
+    const d = new Date(options.before);
+    if (!Number.isNaN(d.getTime())) filter.lastMessageAt = { $lt: d };
+  }
+  return Conversation.find(filter)
     .populate("participants", "name avatar")
     .populate("lastMessage")
-    .sort({ lastMessageAt: -1 });
+    .sort({ lastMessageAt: -1 })
+    .limit(Math.min(options.limit || 50, 100));
 };
 
 const updateConversationLastMessage = async (
@@ -84,10 +121,23 @@ const updateConversationLastMessage = async (
   await Conversation.findByIdAndUpdate(conversationId, update);
 };
 
+/** Real number of messages this user has not read in the conversation. */
+const countUnread = (conversationId: string, userId: string) =>
+  Message.countDocuments({
+    conversation: conversationId,
+    sender: { $ne: userId },
+    "readBy.userId": { $ne: userId },
+  });
+
+const setUnreadCount = async (conversationId: string, userId: string, count: number) => {
+  await Conversation.findByIdAndUpdate(conversationId, {
+    $set: { [`unreadCounts.${userId}`]: Math.max(0, count) },
+  });
+};
+
 /**
  * Mark conversation read for a user.
  * Always $set 0 — opening a thread means "no unread left".
- * Avoids negative counters under concurrent getMessages/markRead.
  */
 const markConversationRead = async (
   conversationId: string,
@@ -98,6 +148,27 @@ const markConversationRead = async (
     $set: { [`unreadCounts.${userId}`]: 0 },
   });
 };
+
+/** Sum of unread messages over all conversations (inbox badge). */
+const totalUnread = async (userId: string): Promise<number> => {
+  const rows = await Conversation.find({ participants: userId, lastMessage: { $ne: null } })
+    .select("unreadCounts")
+    .lean();
+  let sum = 0;
+  for (const r of rows) {
+    const map: any = r.unreadCounts;
+    const v = map instanceof Map ? map.get(userId) : map?.[userId];
+    sum += Number(v) || 0;
+  }
+  return sum;
+};
+
+const setBlocked = (conversationId: string, userId: string, blocked: boolean) =>
+  Conversation.findByIdAndUpdate(
+    conversationId,
+    blocked ? { $addToSet: { blockedBy: userId } } : { $pull: { blockedBy: userId } },
+    { returnDocument: "after" },
+  );
 
 // ─── Message Repository ────────────────────────────────
 const resolveMessageUrls = (msg: any) => {
@@ -120,43 +191,44 @@ const createMessage = async (data: Partial<TMessage>): Promise<TMessage> => {
   return Message.create(data);
 };
 
+/**
+ * Newest-first page, returned oldest-first for display. `before` is a message id
+ * (stable cursor) or, for older apps, an ISO date.
+ */
 const findMessagesByConversation = async (
   conversationId: string,
   options: { page: number; limit: number; before?: string },
 ) => {
   const filter: any = { conversation: conversationId };
   if (options.before) {
-    filter.createdAt = { $lt: new Date(options.before) };
+    if (Types.ObjectId.isValid(options.before) && /^[0-9a-fA-F]{24}$/.test(options.before)) {
+      filter._id = { $lt: new Types.ObjectId(options.before) };
+    } else {
+      const d = new Date(options.before);
+      if (!Number.isNaN(d.getTime())) filter.createdAt = { $lt: d };
+    }
   }
 
-  const total = await Message.countDocuments(filter);
+  const messages = await Message.find(filter)
+    .populate("sender", "name avatar")
+    .sort({ _id: -1 })
+    .limit(options.limit + 1);
 
-  let messages;
-  if (options.before) {
-    // Load more (scroll up): get older messages, sort newest-first then reverse for oldest-first display
-    messages = await Message.find(filter)
-      .populate("sender", "name avatar")
-      .sort({ createdAt: -1 })
-      .limit(options.limit);
-    messages.reverse();
-  } else {
-    // Initial load: get the LATEST messages (newest first, limit, then reverse for oldest-first display)
-    messages = await Message.find(filter)
-      .populate("sender", "name avatar")
-      .sort({ createdAt: -1 })
-      .limit(options.limit);
-    messages.reverse();
-  }
+  const hasMore = messages.length > options.limit;
+  if (hasMore) messages.pop();
+  messages.reverse();
 
-  // Resolve MinIO keys to full URLs
   const resolved = messages.map((msg) => resolveMessageUrls(msg.toObject()));
+  const total = options.before ? undefined : await Message.countDocuments({ conversation: conversationId });
 
   return {
     docs: resolved,
-    total,
+    hasMore,
+    // First message of the page = the cursor for "load older".
+    nextBefore: hasMore && resolved.length ? String(resolved[0]._id) : null,
+    ...(total !== undefined ? { total, totalPages: Math.ceil(total / options.limit) } : {}),
     page: options.page,
     limit: options.limit,
-    totalPages: Math.ceil(total / options.limit),
   };
 };
 
@@ -202,12 +274,11 @@ const claimOfferStatus = async (
     type: "offer",
     "offerData.status": { $in: fromStatuses },
   } as Record<string, unknown>;
-  return Message.findOneAndUpdate(filter, { $set: update }, { new: true });
+  return Message.findOneAndUpdate(filter, { $set: update }, { returnDocument: "after" });
 };
 
 /**
  * Atomically transition offer status only from PENDING.
- * Returns null if already transitioned (idempotent guard for accept/reject/cancel).
  */
 const updateOfferStatusIfPending = async (
   messageId: string,
@@ -226,37 +297,55 @@ const updateOfferStatus = async (
   if (acceptedJobId) {
     update["offerData.acceptedJobId"] = acceptedJobId;
   }
-  return Message.findByIdAndUpdate(messageId, { $set: update }, { new: true });
+  return Message.findByIdAndUpdate(messageId, { $set: update }, { returnDocument: "after" });
 };
 
+/**
+ * Edit a still-PENDING offer. The write only succeeds if nobody changed the
+ * offer since `expectedVersion`, and it bumps the version so a client who was
+ * looking at the old terms can no longer accept them.
+ */
 const updateOfferData = async (
   messageId: string,
   offerData: Partial<any>,
+  expectedVersion: number,
 ) => {
   const setFields: any = {};
   if (!offerData) return null;
-  if (offerData.title !== undefined) setFields["offerData.title"] = offerData.title;
-  if (offerData.description !== undefined) setFields["offerData.description"] = offerData.description;
-  if (offerData.price !== undefined) setFields["offerData.price"] = offerData.price;
-  if (offerData.priceType !== undefined) setFields["offerData.priceType"] = offerData.priceType;
-  if (offerData.date !== undefined) setFields["offerData.date"] = offerData.date;
-  if (offerData.startTime !== undefined) setFields["offerData.startTime"] = offerData.startTime;
-  if (offerData.endTime !== undefined) setFields["offerData.endTime"] = offerData.endTime;
-  if (offerData.address !== undefined) setFields["offerData.address"] = offerData.address;
-  if (offerData.location !== undefined) setFields["offerData.location"] = offerData.location;
-  if (offerData.paymentMethod !== undefined) setFields["offerData.paymentMethod"] = offerData.paymentMethod;
-  if (offerData.images !== undefined) setFields["offerData.images"] = offerData.images;
-  if (offerData.commissionDeducted !== undefined) setFields["offerData.commissionDeducted"] = offerData.commissionDeducted;
+  for (const key of [
+    "title",
+    "description",
+    "price",
+    "priceType",
+    "date",
+    "startTime",
+    "endTime",
+    "address",
+    "location",
+    "paymentMethod",
+    "images",
+    "commissionDeducted",
+    "totalAmount",
+    "hourlyRate",
+    "hours",
+    "feePercentage",
+    "helperNet",
+    "expiresAt",
+  ]) {
+    if (offerData[key] !== undefined) setFields[`offerData.${key}`] = offerData[key];
+  }
+  setFields["offerData.version"] = expectedVersion + 1;
 
   const filter: any = {
     _id: messageId,
     type: "offer",
     "offerData.status": OfferStatus.PENDING,
+    $or: [{ "offerData.version": expectedVersion }, ...(expectedVersion === 1 ? [{ "offerData.version": { $exists: false } }] : [])],
   };
-  return Message.findOneAndUpdate(filter, { $set: setFields }, { new: true });
+  return Message.findOneAndUpdate(filter, { $set: setFields }, { returnDocument: "after" });
 };
 
-/** Reset online offers stuck in AWAITING_PAYMENT longer than hours back to PENDING. */
+/** Online offers stuck in AWAITING_PAYMENT longer than `hours` go back to PENDING (cron). */
 const expireStuckAwaitingPayment = async (hours = 24): Promise<number> => {
   const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000);
   const res = await Message.updateMany(
@@ -270,6 +359,36 @@ const expireStuckAwaitingPayment = async (hours = 24): Promise<number> => {
   return res.modifiedCount || 0;
 };
 
+/** Offers nobody answered before their expiry (cron). */
+const findExpiredOffers = (limit = 100) =>
+  Message.find({
+    type: "offer",
+    "offerData.status": { $in: ["pending", "awaiting_payment"] },
+    $or: [
+      { "offerData.expiresAt": { $lte: new Date() } },
+      // Older offers without an expiry date: 48 h after they were sent.
+      {
+        "offerData.expiresAt": { $exists: false },
+        createdAt: { $lte: new Date(Date.now() - 48 * 3_600_000) },
+      },
+    ],
+  } as any)
+    .limit(limit);
+
+const countOpenOffersBySender = (senderId: string) =>
+  Message.countDocuments({
+    sender: senderId,
+    type: "offer",
+    "offerData.status": { $in: ["pending", "awaiting_payment"] },
+  } as any);
+
+const findOpenOffersOfUser = (userId: string) =>
+  Message.find({
+    type: "offer",
+    "offerData.status": { $in: ["pending", "awaiting_payment"] },
+    $or: [{ sender: userId }],
+  } as any).limit(200);
+
 const findUnreadMessages = async (conversationId: string, userId: string) => {
   return Message.find({
     conversation: conversationId,
@@ -280,10 +399,15 @@ const findUnreadMessages = async (conversationId: string, userId: string) => {
 
 export const ChatRepository = {
   createConversation,
+  backfillConversationKeys,
   findConversationById,
   findUserConversations,
   updateConversationLastMessage,
+  countUnread,
+  setUnreadCount,
   markConversationRead,
+  totalUnread,
+  setBlocked,
   createMessage,
   findMessagesByConversation,
   markMessagesRead,
@@ -293,5 +417,8 @@ export const ChatRepository = {
   claimOfferStatus,
   updateOfferData,
   expireStuckAwaitingPayment,
+  findExpiredOffers,
+  countOpenOffersBySender,
+  findOpenOffersOfUser,
   findUnreadMessages,
 };

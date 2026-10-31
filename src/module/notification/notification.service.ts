@@ -8,7 +8,7 @@ const listMyNotifications = async (
   query: { page?: number; limit?: number; audience?: string },
 ) => {
   const audience =
-    query.audience === "admin" ? NotificationAudience.ADMIN : undefined;
+    query.audience === "admin" ? NotificationAudience.ADMIN : NotificationAudience.USER;
   return NotificationRepository.listForUser(userId, {
     page: query.page,
     limit: query.limit,
@@ -18,7 +18,7 @@ const listMyNotifications = async (
 
 const getUnreadCount = async (userId: string, audience?: string) => {
   const aud =
-    audience === "admin" ? NotificationAudience.ADMIN : undefined;
+    audience === "admin" ? NotificationAudience.ADMIN : NotificationAudience.USER;
   return { unread: await NotificationRepository.unreadCount(userId, aud) };
 };
 
@@ -30,9 +30,21 @@ const markOneRead = async (userId: string, id: string) => {
   return updated;
 };
 
-const markAllRead = async (userId: string) => {
-  const count = await NotificationRepository.markAllRead(userId);
+const markAllRead = async (userId: string, audience?: string) => {
+  const aud = audience === "admin" ? NotificationAudience.ADMIN : NotificationAudience.USER;
+  const count = await NotificationRepository.markAllRead(userId, aud);
   return { marked: count };
+};
+
+const removeOne = async (userId: string, id: string) => {
+  const deleted = await NotificationRepository.removeOne(userId, id);
+  if (!deleted) throw new AppError(StatusCodes.NOT_FOUND, "Notification not found");
+  return { deleted };
+};
+
+const removeAll = async (userId: string, audience?: string) => {
+  const aud = audience === "admin" ? NotificationAudience.ADMIN : NotificationAudience.USER;
+  return { deleted: await NotificationRepository.removeAll(userId, aud) };
 };
 
 export const NotificationService = {
@@ -40,4 +52,6 @@ export const NotificationService = {
   getUnreadCount,
   markOneRead,
   markAllRead,
+  removeOne,
+  removeAll,
 };

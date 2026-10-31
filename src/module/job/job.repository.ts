@@ -24,6 +24,8 @@ const resolveJobImages = (job: any) => {
   };
 };
 
+const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 const create = async (data: Partial<TJob>) => {
   const job = await Job.create(data);
   return job;
@@ -43,17 +45,22 @@ const findById = async (
   return query.exec();
 };
 
+/**
+ * Raw populated job. WHAT the caller may see is decided by job.serializer.ts —
+ * never send this object to a client directly.
+ */
 const findDetailsById = async (id: string | Types.ObjectId) => {
   const doc = await Job.findById(id)
     .populate("postedBy", "name phone email avatar address city rating reviewCount")
     .populate("assignedTo", "name phone email avatar address city rating reviewCount pricePerHour experience bio")
-    .populate("category", "name icon")
+    .populate("category", "name slug names icon")
     .populate("cancelledBy", "name avatar")
     .exec();
   if (!doc) return null;
-  return resolveJobImages(doc);
+  return doc;
 };
 
+/** Staff listing (dashboard). */
 const findAll = async (
   filter: FilterQuery<TJob> = {},
   options: QueryOptions = {},
@@ -68,7 +75,7 @@ const findAll = async (
       .limit(limit)
       .populate("postedBy", "name phone avatar email")
       .populate("assignedTo", "name phone avatar rating")
-      .populate("category", "name icon")
+      .populate("category", "name slug names icon")
       .exec(),
     Job.countDocuments(filter).exec(),
   ]);
@@ -84,19 +91,20 @@ const findAll = async (
 
 const updateById = async (
   id: string | Types.ObjectId,
-  data: Partial<TJob>,
+  data: Partial<TJob> | Record<string, unknown>,
 ) => {
-  return Job.findByIdAndUpdate(id, data, { new: true }).exec();
+  return Job.findByIdAndUpdate(id, data as any, { returnDocument: "after", runValidators: true }).exec();
 };
 
 /**
  * Atomically claim an OPEN job for a helper.
- * Returns null if already taken / not open.
+ * Returns null if already taken / not open. The fee in force and the resulting
+ * amounts are frozen on the job at this moment.
  */
 const claimOpenJob = async (
   jobId: string | Types.ObjectId,
   helperId: string | Types.ObjectId,
-  commissionDeducted: number,
+  snapshot: { commission: number; feePercentage: number; helperNet: number },
 ) => {
   return Job.findOneAndUpdate(
     { _id: jobId, status: "open" } as any,
@@ -104,16 +112,69 @@ const claimOpenJob = async (
       $set: {
         status: "in_progress",
         assignedTo: new Types.ObjectId(helperId),
-        commissionDeducted,
+        commissionDeducted: snapshot.commission,
+        feePercentage: snapshot.feePercentage,
+        helperNet: snapshot.helperNet,
+        acceptedAt: new Date(),
       },
     },
-    { new: true },
+    { returnDocument: "after", runValidators: true },
+  ).exec();
+};
+
+/** Helper progress: in_progress → on_the_way. */
+const markOnTheWay = async (jobId: string | Types.ObjectId, helperId: string) => {
+  return Job.findOneAndUpdate(
+    { _id: jobId, assignedTo: helperId, status: "in_progress" } as any,
+    { $set: { status: "on_the_way", onTheWayAt: new Date() } },
+    { returnDocument: "after" },
+  ).exec();
+};
+
+/** Helper progress: in_progress | on_the_way → arrived. */
+const markArrived = async (jobId: string | Types.ObjectId, helperId: string) => {
+  return Job.findOneAndUpdate(
+    { _id: jobId, assignedTo: helperId, status: { $in: ["in_progress", "on_the_way"] } } as any,
+    { $set: { status: "arrived", arrivedAt: new Date() } },
+    { returnDocument: "after" },
+  ).exec();
+};
+
+/** Helper says the work is done: the client now has `confirmHours` to confirm. */
+const markFinishedByHelper = async (
+  jobId: string | Types.ObjectId,
+  helperId: string,
+  confirmHours: number,
+) => {
+  const now = new Date();
+  return Job.findOneAndUpdate(
+    {
+      _id: jobId,
+      assignedTo: helperId,
+      status: { $in: ["in_progress", "on_the_way", "arrived"] },
+      helperFinishedAt: { $exists: false },
+    } as any,
+    {
+      $set: {
+        helperFinishedAt: now,
+        autoCompleteAt: new Date(now.getTime() + confirmHours * 3_600_000),
+      },
+    },
+    { returnDocument: "after" },
+  ).exec();
+};
+
+const setDispute = async (jobId: string | Types.ObjectId, open: boolean) => {
+  return Job.findByIdAndUpdate(
+    jobId,
+    { $set: { disputeOpen: open }, ...(open ? { $unset: { autoCompleteAt: 1 } } : {}) },
+    { returnDocument: "after" },
   ).exec();
 };
 
 /**
- * Atomically move IN_PROGRESS → COMPLETED.
- * Returns null if not in progress (already completed/cancelled).
+ * Atomically move an active job → COMPLETED.
+ * Returns null if not active (already completed/cancelled).
  */
 const transitionInProgressToCompleted = async (
   jobId: string | Types.ObjectId,
@@ -125,8 +186,9 @@ const transitionInProgressToCompleted = async (
         status: "completed",
         completedAt: new Date(),
       },
+      $unset: { autoCompleteAt: 1 },
     },
-    { new: true },
+    { returnDocument: "after" },
   ).exec();
 };
 
@@ -137,7 +199,7 @@ const markEscrowCredited = async (jobId: string | Types.ObjectId) => {
   return Job.findOneAndUpdate(
     { _id: jobId, escrowCredited: { $ne: true } } as any,
     { $set: { escrowCredited: true } },
-    { new: true },
+    { returnDocument: "after" },
   ).exec();
 };
 
@@ -154,19 +216,21 @@ const markCashReceived = async (jobId: string | Types.ObjectId) => {
       paymentStatus: { $ne: "paid" },
     } as any,
     { $set: { paymentStatus: "paid" } },
-    { new: true },
+    { returnDocument: "after" },
   ).exec();
 };
 
 /**
- * Atomically cancel OPEN or IN_PROGRESS job (winner does refunds).
+ * Atomically cancel a job that is not finished (winner does refunds).
  * Returns null if already completed/cancelled.
  */
 const transitionToCancelled = async (
   jobId: string | Types.ObjectId,
   payload: {
     reason: string;
-    cancelledBy: string | Types.ObjectId;
+    cancelledBy?: string | Types.ObjectId;
+    cancelledByRole?: "client" | "helper" | "admin" | "system";
+    code?: string;
     refundStatus?: string;
     refundReference?: string;
   },
@@ -174,21 +238,24 @@ const transitionToCancelled = async (
   return Job.findOneAndUpdate(
     {
       _id: jobId,
-      status: { $in: ["open", "in_progress", "pending_payment"] },
+      status: { $in: ["open", "in_progress", "on_the_way", "arrived", "pending_payment"] },
     } as any,
     {
       $set: {
         status: "cancelled",
         cancellationReason: payload.reason,
-        cancelledBy: new Types.ObjectId(payload.cancelledBy),
+        ...(payload.cancelledBy ? { cancelledBy: new Types.ObjectId(payload.cancelledBy) } : {}),
+        ...(payload.cancelledByRole ? { cancelledByRole: payload.cancelledByRole } : {}),
+        ...(payload.code ? { cancellationCode: payload.code } : {}),
         cancelledAt: new Date(),
         ...(payload.refundStatus ? { refundStatus: payload.refundStatus } : {}),
         ...(payload.refundReference
           ? { refundReference: payload.refundReference }
           : {}),
       },
+      $unset: { autoCompleteAt: 1 },
     },
-    { new: true },
+    { returnDocument: "after" },
   ).exec();
 };
 
@@ -199,7 +266,7 @@ const markPendingPaymentOpen = async (jobId: string | Types.ObjectId) => {
   return Job.findOneAndUpdate(
     { _id: jobId, status: "pending_payment" } as any,
     { $set: { status: "open" } },
-    { new: true },
+    { returnDocument: "after" },
   ).exec();
 };
 
@@ -214,6 +281,8 @@ const countByStatus = async () => {
     pending_payment: 0,
     open: 0,
     in_progress: 0,
+    on_the_way: 0,
+    arrived: 0,
     completed: 0,
     cancelled: 0,
   };
@@ -234,10 +303,8 @@ const findCancellations = async (
   const skip = (page - 1) * limit;
   const filter: Record<string, unknown> = { status: "cancelled" };
   if (search) {
-    filter.$or = [
-      { title: { $regex: search, $options: "i" } },
-      { cancellationReason: { $regex: search, $options: "i" } },
-    ];
+    const re = { $regex: escapeRegex(search), $options: "i" };
+    filter.$or = [{ title: re }, { cancellationReason: re }];
   }
 
   const [docs, total] = await Promise.all([
@@ -252,7 +319,7 @@ const findCancellations = async (
     Job.countDocuments(filter as any).exec(),
   ]);
 
-  // Lifetime cancel counts — client vs helper separately
+  // Lifetime cancel counts — client vs helper separately (two grouped queries, not one per row)
   const userIds = new Set<string>();
   for (const job of docs) {
     const p = (job as any).postedBy?._id;
@@ -260,19 +327,20 @@ const findCancellations = async (
     if (p) userIds.add(String(p));
     if (a) userIds.add(String(a));
   }
+  const ids = [...userIds].map((id) => new Types.ObjectId(id));
 
-  const clientCounts = new Map<string, number>();
-  const helperCounts = new Map<string, number>();
-  await Promise.all(
-    [...userIds].map(async (id) => {
-      const [asClient, asHelper] = await Promise.all([
-        Job.countDocuments({ status: "cancelled", postedBy: id } as any),
-        Job.countDocuments({ status: "cancelled", assignedTo: id } as any),
-      ]);
-      clientCounts.set(id, asClient);
-      helperCounts.set(id, asHelper);
-    }),
-  );
+  const [clientRows, helperRows] = await Promise.all([
+    Job.aggregate([
+      { $match: { status: "cancelled", postedBy: { $in: ids } } },
+      { $group: { _id: "$postedBy", n: { $sum: 1 } } },
+    ]),
+    Job.aggregate([
+      { $match: { status: "cancelled", assignedTo: { $in: ids } } },
+      { $group: { _id: "$assignedTo", n: { $sum: 1 } } },
+    ]),
+  ]);
+  const clientCounts = new Map<string, number>(clientRows.map((r) => [String(r._id), r.n]));
+  const helperCounts = new Map<string, number>(helperRows.map((r) => [String(r._id), r.n]));
 
   const enriched = docs.map((job) => {
     const obj = resolveJobImages(job);
@@ -317,7 +385,7 @@ const appendHistory = async (
         },
       },
     },
-    { new: true },
+    { returnDocument: "after" },
   ).exec();
 };
 
@@ -325,10 +393,14 @@ const deleteById = async (id: string | Types.ObjectId) => {
   return Job.findByIdAndDelete(id).exec();
 };
 
+/**
+ * Open jobs around a point, nearest first, paginated. Callers shape the result
+ * with job.serializer (public view: blurred position, no contact data).
+ */
 const findNearby = async (
   longitude: number,
   latitude: number,
-  maxDistance: number = 10000, // default 10km
+  maxDistance: number = 10000,
   additionalFilter: FilterQuery<TJob> = {},
   options: QueryOptions = {},
 ) => {
@@ -339,17 +411,13 @@ const findNearby = async (
     ...additionalFilter,
     location: {
       $near: {
-        $geometry: {
-          type: "Point",
-          coordinates: [longitude, latitude],
-        },
+        $geometry: { type: "Point", coordinates: [longitude, latitude] },
         $maxDistance: maxDistance,
       },
     },
   };
 
-  // $near can't be used in countDocuments (MongoDB 5.1+ aggregation restriction).
-  // Use $geoWithin + $centerSphere for the count instead.
+  // $near can't be used in countDocuments; $geoWithin + $centerSphere gives the same set.
   const countFilter: FilterQuery<TJob> = {
     ...additionalFilter,
     location: {
@@ -360,55 +428,28 @@ const findNearby = async (
   };
 
   const [docs, total] = await Promise.all([
-    // $near already sorts by distance — no .sort() needed
-    Job.find(geoFilter).skip(skip).limit(limit).populate("postedBy", "name avatar").populate("category", "name icon").exec(),
+    Job.find(geoFilter)
+      .skip(skip)
+      .limit(limit)
+      .populate("postedBy", "name avatar rating reviewCount")
+      .populate("category", "name slug names icon")
+      .exec(),
     Job.countDocuments(countFilter).exec(),
   ]);
 
-  const R = 6378100; // earth radius meters
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const docsWithDistance = docs.map((doc) => {
-    const obj = resolveJobImages(doc) as any;
-    const coords = obj.location?.coordinates;
-    if (Array.isArray(coords) && coords.length >= 2) {
-      const [lng, lat] = coords;
-      const dLat = toRad(Number(lat) - latitude);
-      const dLng = toRad(Number(lng) - longitude);
-      const a =
-        Math.sin(dLat / 2) ** 2 +
-        Math.cos(toRad(latitude)) *
-          Math.cos(toRad(Number(lat))) *
-          Math.sin(dLng / 2) ** 2;
-      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-      const meters = R * c;
-      obj.distanceKm = Math.round((meters / 1000) * 10) / 10;
-      if (typeof obj.address === "string" && obj.address.includes(",")) {
-        const parts = obj.address.split(",").map((s: string) => s.trim()).filter(Boolean);
-        if (parts.length >= 2) {
-          obj.address = `${parts[0]}, ${parts[1]}`;
-        }
-      }
-    }
-    return obj;
-  });
-
-  return {
-    docs: docsWithDistance,
-    total,
-    page,
-    limit,
-    totalPages: Math.ceil(total / limit),
-  };
+  return { docs, total, page, limit, totalPages: Math.ceil(total / limit) };
 };
 
 const findMany = async (
   filter: FilterQuery<TJob> = {},
-  options: { sort?: any; populate?: string } = {},
+  options: { sort?: any; populate?: string; skip?: number; limit?: number } = {},
 ) => {
   let query = Job.find(filter);
   if (options.sort) {
     query = query.sort(options.sort);
   }
+  if (options.skip) query = query.skip(options.skip);
+  if (options.limit) query = query.limit(options.limit);
   const populates = (options.populate || "").split(",").map((s) => s.trim()).filter(Boolean);
   // Always populate cancelledBy name for cancel details
   if (!populates.includes("cancelledBy")) {
@@ -419,28 +460,14 @@ const findMany = async (
       field === "cancelledBy"
         ? "name avatar"
         : field === "postedBy"
-          ? "name avatar"
+          ? "name avatar rating reviewCount"
           : field === "assignedTo"
-            ? "name avatar"
+            ? "name avatar rating reviewCount"
             : undefined;
     query = query.populate(field, fields);
   }
   const docs = await query.exec();
-  return docs.map((doc) => {
-    const obj = resolveJobImages(doc) as any;
-    // Helper-facing safety: never send raw coords; shorten long addresses.
-    if (typeof obj.address === "string" && obj.address.includes(",")) {
-      const parts = obj.address
-        .split(",")
-        .map((s: string) => s.trim())
-        .filter(Boolean);
-      if (parts.length >= 3) {
-        obj.addressPublic = parts.slice(0, 2).join(", ");
-        obj.address = obj.addressPublic;
-      }
-    }
-    return obj;
-  });
+  return docs.map((doc) => resolveJobImages(doc) as any);
 };
 
 export const JobRepository = {
@@ -453,6 +480,10 @@ export const JobRepository = {
   deleteById,
   findNearby,
   claimOpenJob,
+  markOnTheWay,
+  markArrived,
+  markFinishedByHelper,
+  setDispute,
   transitionInProgressToCompleted,
   markEscrowCredited,
   markCashReceived,

@@ -13,7 +13,7 @@ import { SupportRoutes } from "../module/support/support.route";
 import { ReviewRoutes } from "../module/review/review.route";
 import { DiditRoutes } from "../module/didit/didit.route";
 import { NotificationRoutes } from "../module/notification/notification.route";
-import { LegalPublicRoutes } from "../module/settings/settings.route";
+import { LegalPublicRoutes, ConfigPublicRoutes } from "../module/settings/settings.route";
 import { DiditController } from "../module/didit/didit.controller";
 
 const router: Router = express.Router();
@@ -38,6 +38,7 @@ const apiRoutes = [
   { path: "/didit", route: DiditRoutes },
   { path: "/notifications", route: NotificationRoutes },
   { path: "/legal", route: LegalPublicRoutes },
+  { path: "/config", route: ConfigPublicRoutes },
   { path: "/webhooks", route: webhookRouter },
 ];
 

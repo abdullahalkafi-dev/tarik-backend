@@ -10,14 +10,14 @@ import config from "../config";
 // Price guidance in MAD: starting estimates for the Moroccan market.
 // Admins tune these in Dashboard → Categories; the seed only fills empty values.
 export const PRD_CATEGORIES = [
-  { name: "Home Cleaning", icon: "cleaning_icon.svg", minHourlyRate: 50, suggestedPriceMin: 150, suggestedPriceMax: 400 },
-  { name: "Furniture Assembly & DIY", icon: "furniture_assembly_icon.svg", minHourlyRate: 70, suggestedPriceMin: 150, suggestedPriceMax: 500 },
-  { name: "Gardening & Plant Care", icon: "garden_icon.svg", minHourlyRate: 50, suggestedPriceMin: 150, suggestedPriceMax: 400 },
-  { name: "Tech Support & Devices", icon: "tech_support_icon.svg", minHourlyRate: 80, suggestedPriceMin: 100, suggestedPriceMax: 400 },
-  { name: "Tutoring & Education", icon: "tutoring_icon.svg", minHourlyRate: 60, suggestedPriceMin: 100, suggestedPriceMax: 300 },
-  { name: "Pet Care & Walking", icon: "pet_care_icon.svg", minHourlyRate: 40, suggestedPriceMin: 50, suggestedPriceMax: 200 },
-  { name: "Tailoring & Alterations", icon: "tailoring_icon.svg", minHourlyRate: 50, suggestedPriceMin: 50, suggestedPriceMax: 300 },
-  { name: "Event & Hospitality", icon: "event_helper_icon.svg", minHourlyRate: 60, suggestedPriceMin: 300, suggestedPriceMax: 1000 },
+  { name: "Home Cleaning", slug: "home_cleaning", icon: "cleaning_icon.svg", sortOrder: 1, isPopular: true, minHourlyRate: 50, suggestedPriceMin: 150, suggestedPriceMax: 400, names: { en: "Home Cleaning", fr: "Ménage à domicile", ar: "تنظيف المنازل", es: "Limpieza del hogar" } },
+  { name: "Furniture Assembly & DIY", slug: "furniture_assembly", icon: "furniture_assembly_icon.svg", sortOrder: 2, isPopular: true, minHourlyRate: 70, suggestedPriceMin: 150, suggestedPriceMax: 500, names: { en: "Furniture Assembly & DIY", fr: "Montage de meubles & bricolage", ar: "تركيب الأثاث والأعمال اليدوية", es: "Montaje de muebles y bricolaje" } },
+  { name: "Gardening & Plant Care", slug: "gardening", icon: "garden_icon.svg", sortOrder: 3, isPopular: false, minHourlyRate: 50, suggestedPriceMin: 150, suggestedPriceMax: 400, names: { en: "Gardening & Plant Care", fr: "Jardinage & soin des plantes", ar: "البستنة والعناية بالنباتات", es: "Jardinería y cuidado de plantas" } },
+  { name: "Tech Support & Devices", slug: "tech_support", icon: "tech_support_icon.svg", sortOrder: 4, isPopular: true, minHourlyRate: 80, suggestedPriceMin: 100, suggestedPriceMax: 400, names: { en: "Tech Support & Devices", fr: "Assistance technique & appareils", ar: "الدعم التقني والأجهزة", es: "Soporte técnico y dispositivos" } },
+  { name: "Tutoring & Education", slug: "tutoring", icon: "tutoring_icon.svg", sortOrder: 5, isPopular: false, minHourlyRate: 60, suggestedPriceMin: 100, suggestedPriceMax: 300, names: { en: "Tutoring & Education", fr: "Cours particuliers & éducation", ar: "الدروس الخصوصية والتعليم", es: "Clases particulares y educación" } },
+  { name: "Pet Care & Walking", slug: "pet_care", icon: "pet_care_icon.svg", sortOrder: 6, isPopular: false, minHourlyRate: 40, suggestedPriceMin: 50, suggestedPriceMax: 200, names: { en: "Pet Care & Walking", fr: "Garde & promenade d'animaux", ar: "رعاية الحيوانات الأليفة والتنزه بها", es: "Cuidado y paseo de mascotas" } },
+  { name: "Tailoring & Alterations", slug: "tailoring", icon: "tailoring_icon.svg", sortOrder: 7, isPopular: false, minHourlyRate: 50, suggestedPriceMin: 50, suggestedPriceMax: 300, names: { en: "Tailoring & Alterations", fr: "Couture & retouches", ar: "الخياطة والتعديلات", es: "Costura y arreglos" } },
+  { name: "Event & Hospitality", slug: "events", icon: "event_helper_icon.svg", sortOrder: 8, isPopular: false, minHourlyRate: 60, suggestedPriceMin: 300, suggestedPriceMax: 1000, names: { en: "Event & Hospitality", fr: "Événements & hôtellerie", ar: "المناسبات والضيافة", es: "Eventos y hostelería" } },
 ];
 
 const PRICING_KEYS = ["minHourlyRate", "suggestedPriceMin", "suggestedPriceMax"] as const;
@@ -31,6 +31,10 @@ export const seedCategories = async (): Promise<Map<string, any>> => {
     if (!existing) {
       existing = await Category.create({
         name: cat.name,
+        slug: cat.slug,
+        names: cat.names,
+        sortOrder: cat.sortOrder,
+        isPopular: cat.isPopular,
         icon: cat.icon,
         isActive: true,
         minHourlyRate: cat.minHourlyRate,
@@ -40,10 +44,16 @@ export const seedCategories = async (): Promise<Map<string, any>> => {
       logger.info(`  ✅ Created category: "${cat.name}" | ID: ${existing._id}`);
     } else {
       // Backfill price guidance without overwriting values set by an admin.
-      const missing: Record<string, number> = {};
+      const missing: Record<string, unknown> = {};
       for (const key of PRICING_KEYS) {
         if (existing.get(key) == null) missing[key] = cat[key];
       }
+      // Identifier and translations for categories that were created before they existed.
+      if (!existing.get("slug")) missing.slug = cat.slug;
+      for (const lang of ["en", "fr", "ar", "es"] as const) {
+        if (!existing.get(`names.${lang}`)) missing[`names.${lang}`] = cat.names[lang];
+      }
+      if (existing.get("sortOrder") == null || existing.get("sortOrder") === 100) missing.sortOrder = cat.sortOrder;
       if (Object.keys(missing).length) {
         await Category.updateOne({ _id: existing._id }, { $set: missing });
         Object.assign(existing, missing);

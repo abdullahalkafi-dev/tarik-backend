@@ -25,6 +25,33 @@ const userSchema = new Schema<TUser>(
     deviceToken: { type: String, default: null },
     deviceTokenPlatform: { type: String, enum: ["android", "ios"], default: "android" },
     deviceTokenUpdatedAt: { type: Date },
+    deviceTokens: [
+      {
+        _id: false,
+        token: { type: String, required: true },
+        platform: { type: String, enum: ["android", "ios"], default: "android" },
+        updatedAt: { type: Date, default: Date.now },
+      },
+    ],
+    locale: { type: String, enum: ["ar", "fr", "en", "es"], default: "fr" },
+    notificationPrefs: {
+      push: { type: Boolean, default: true },
+      sound: { type: Boolean, default: true },
+      vibrate: { type: Boolean, default: true },
+      payments: { type: Boolean, default: true },
+      appUpdates: { type: Boolean, default: true },
+      newService: { type: Boolean, default: true },
+    },
+    isAvailable: { type: Boolean, default: true },
+    lastKnownLocation: {
+      type: { type: String, enum: ["Point"] },
+      coordinates: { type: [Number] },
+    },
+    lastKnownLocationAt: { type: Date },
+    acceptedLegalVersion: { type: Number },
+    acceptedLegalAt: { type: Date },
+    cancelStrikes: { type: Number, default: 0 },
+    cancelStrikeUntil: { type: Date },
 
     // Helper fields
     isHelperFormSubmitted: { type: Boolean, default: false },
@@ -45,13 +72,13 @@ const userSchema = new Schema<TUser>(
         reviewedAt: { type: Date },
       },
     ],
-    age: { type: Number, min: 13 },
+    age: { type: Number, min: 18, max: 100 },
     city: { type: String },
     language: { type: String },
     serviceType: { type: Schema.Types.ObjectId, ref: "Category" },
-    pricePerHour: { type: Number },
-    experience: { type: Number },
-    serviceRadius: { type: Number },
+    pricePerHour: { type: Number, min: 0, max: 2000 },
+    experience: { type: Number, min: 0, max: 60 },
+    serviceRadius: { type: Number, min: 0.5, max: 60 },
     profilePhotos: [{ type: String }],
     documentType: {
       type: String,
@@ -69,8 +96,13 @@ const userSchema = new Schema<TUser>(
       livenessScore: { type: Number },
       livenessPassed: { type: Boolean },
       ocrName: { type: String },
+      dateOfBirth: { type: String },
+      documentExpiry: { type: String },
+      issuingCountry: { type: String },
+      nameMatchScore: { type: Number },
       warnings: [{ type: String }],
     },
+    diditSessionCount: { type: Number, default: 0 },
     documentNumberHash: { type: String, index: true },
     maskedDocumentNumber: { type: String },
 
@@ -98,6 +130,8 @@ const userSchema = new Schema<TUser>(
 
     isDeleted: { type: Boolean, default: false },
     isBlocked: { type: Boolean, default: false },
+    blockedReason: { type: String, maxlength: 500 },
+    blockedAt: { type: Date },
     rating: { type: Number, default: 0 },
     reviewCount: { type: Number, default: 0 },
   },
@@ -106,6 +140,9 @@ const userSchema = new Schema<TUser>(
 
 // 2dsphere index for geo queries
 userSchema.index({ location: "2dsphere" });
+userSchema.index({ "deviceTokens.token": 1 });
+userSchema.index({ deviceToken: 1 }, { sparse: true });
+userSchema.index({ helperApplicationStatus: 1, isBlocked: 1, isDeleted: 1, serviceType: 1 });
 // MongoDB treats a document field named `language` as the text-index language
 // override; helpers store free text there ("Arabic, French"), which Mongo
 // rejects. Point the override at an unused field and don't stem names.
