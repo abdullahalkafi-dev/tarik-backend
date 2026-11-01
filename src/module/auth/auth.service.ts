@@ -211,6 +211,19 @@ const getAccessToken = async (refreshToken: string, meta: { userAgent?: string }
   return generateTokens(auth, String(user._id), { sid, userAgent: meta.userAgent });
 };
 
+// ─── Socket token ───────────────────────────────────────
+/**
+ * Short-lived token that is good for opening a socket connection and nothing
+ * else (the HTTP API rejects any token that carries a `type`).
+ */
+const SOCKET_TOKEN_TTL = "2m";
+const createSocketToken = (input: { userId: string; tokenVersion: number; sessionId?: string }) =>
+  createJwtToken(
+    { userId: input.userId, tv: input.tokenVersion, sid: input.sessionId, type: "socket" },
+    config.jwt.jwt_secret as string,
+    SOCKET_TOKEN_TTL,
+  );
+
 // ─── Logout ─────────────────────────────────────────────
 const logout = async (sid?: string) => {
   if (sid) {
@@ -599,6 +612,7 @@ export const AuthService = {
   getAccessToken,
   logout,
   logoutAll,
+  createSocketToken,
   changePassword,
   // Phone auth
   registerWithPhone,

@@ -41,7 +41,7 @@ const handleCallback = catchAsync(async (req, res) => {
       <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Payment ${isSuccess ? "Successful" : "Status"} - Tarik</title>
+        <title>Payment ${isSuccess ? "Successful" : "Status"} - 3awniNet</title>
         <style>
           * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
           body { background-color: #0F172A; color: #F8FAFC; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; text-align: center; }
@@ -58,8 +58,8 @@ const handleCallback = catchAsync(async (req, res) => {
         <div class="card">
           <div class="icon-box">${isSuccess ? '✓' : '✕'}</div>
           <h1>${isSuccess ? 'Payment Successful!' : 'Payment Incomplete'}</h1>
-          <p>${isSuccess ? 'Your payment was processed successfully. Tap below to return to the Tarik app.' : 'Your payment could not be completed. Tap below to return to the app.'}</p>
-          <a href="${deepLinkUrl}" class="btn">Return to Tarik App</a>
+          <p>${isSuccess ? 'Your payment was processed successfully. Tap below to return to the 3awniNet app.' : 'Your payment could not be completed. Tap below to return to the app.'}</p>
+          <a href="${deepLinkUrl}" class="btn">Return to 3awniNet App</a>
           <p class="hint">Opening the app automatically...</p>
         </div>
         <script>

@@ -41,6 +41,15 @@ router.post(
 router.post("/logout", auth(), validateRequest(AuthDto.logout), AuthController.logout);
 
 /**
+ * @route   POST /api/v1/auth/socket-token
+ * @desc    A 2-minute token that only opens a realtime (socket) connection. The
+ *          dashboard keeps its login in httpOnly cookies, so its page code asks
+ *          for this instead of ever holding the real access token.
+ * @access  Private (staff)
+ */
+router.post("/socket-token", auth("admin", "staff", "superAdmin"), AuthController.socketToken);
+
+/**
  * @route   POST /api/v1/auth/logout-all
  * @desc    End every session of the account on all devices
  * @access  Private

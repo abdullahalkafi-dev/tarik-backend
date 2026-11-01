@@ -611,8 +611,9 @@ const getStats = async () => {
     UserRepository.count({ isHelperFormSubmitted: true, helperApplicationStatus: HelperApplicationStatus.APPROVED, isDeleted: false }),
     UserRepository.count({ isHelperFormSubmitted: true, helperApplicationStatus: HelperApplicationStatus.REJECTED }),
     UserRepository.count({ isHelperFormSubmitted: true, helperApplicationStatus: HelperApplicationStatus.PENDING_APPEAL }),
-    UserRepository.count({ helperApplicationStatus: HelperApplicationStatus.APPROVED, updatedAt: { $gte: startThis } } as any),
-    UserRepository.count({ helperApplicationStatus: HelperApplicationStatus.APPROVED, updatedAt: { $gte: startPrev, $lt: startThis } } as any),
+    // New helpers = approvals recorded in the application history (not any profile edit).
+    UserRepository.count({ helperApplicationStatus: HelperApplicationStatus.APPROVED, applicationHistory: { $elemMatch: { status: HelperApplicationStatus.APPROVED, reviewedAt: { $gte: startThis } } } } as any),
+    UserRepository.count({ helperApplicationStatus: HelperApplicationStatus.APPROVED, applicationHistory: { $elemMatch: { status: HelperApplicationStatus.APPROVED, reviewedAt: { $gte: startPrev, $lt: startThis } } } } as any),
     Job.countDocuments({}),
     Job.countDocuments({ createdAt: { $gte: startThis } }),
     Job.countDocuments({ createdAt: { $gte: startPrev, $lt: startThis } }),

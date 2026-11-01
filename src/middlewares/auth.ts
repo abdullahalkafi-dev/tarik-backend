@@ -5,6 +5,7 @@ import config from "../config";
 import AppError from "../errors/AppError";
 import { verifyJwtToken } from "jwt";
 import { UserRepository } from "module/user/user.repository";
+import { Session } from "module/auth/session.model";
 
 const STAFF_ROLES = ["admin", "staff", "superAdmin"];
 
@@ -57,6 +58,16 @@ const auth =
       }
 
       if ((decoded.tv ?? 0) !== (authDoc.tokenVersion ?? 0)) {
+        throw new AppError(
+          StatusCodes.UNAUTHORIZED,
+          "Your session has ended. Please log in again.",
+          { code: "SESSION_REVOKED" },
+        );
+      }
+
+      // Signing out deletes the session: the access token must stop working with it.
+      // (Tokens issued before sessions existed carry no `sid` and are left alone.)
+      if (decoded.sid && !(await Session.exists({ _id: decoded.sid }))) {
         throw new AppError(
           StatusCodes.UNAUTHORIZED,
           "Your session has ended. Please log in again.",

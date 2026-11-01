@@ -64,7 +64,7 @@ const handleCallback = catchAsync(async (req: Request, res: Response) => {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Verification Complete - Tarik</title>
+      <title>Verification Complete - 3awniNet</title>
       <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
         body { background-color: #0F172A; color: #F8FAFC; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; text-align: center; }
@@ -80,8 +80,8 @@ const handleCallback = catchAsync(async (req: Request, res: Response) => {
       <div class="card">
         <div class="icon-box">${isApproved ? '✓' : 'ℹ'}</div>
         <h1>${isApproved ? 'Verification Approved!' : 'Verification Complete'}</h1>
-        <p>${isApproved ? 'Your identity has been successfully verified. You can now return to the Tarik app.' : 'Your identity documents have been submitted. Please return to the Tarik app to continue.'}</p>
-        <a href="tarik://didit/callback?sessionId=${encodeURIComponent(sessionId || "")}&status=${encodeURIComponent(status)}" class="btn">Return to Tarik App</a>
+        <p>${isApproved ? 'Your identity has been successfully verified. You can now return to the 3awniNet app.' : 'Your identity documents have been submitted. Please return to the 3awniNet app to continue.'}</p>
+        <a href="tarik://didit/callback?sessionId=${encodeURIComponent(sessionId || "")}&status=${encodeURIComponent(status)}" class="btn">Return to 3awniNet App</a>
         <p style="font-size: 12px; color: #64748B; margin-top: 16px;">Returning to app automatically...</p>
       </div>
       <script>

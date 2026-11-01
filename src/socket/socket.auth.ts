@@ -4,6 +4,7 @@ import { Secret } from "jsonwebtoken";
 import config from "config";
 import { verifyJwtToken } from "jwt";
 import { UserRepository } from "module/user/user.repository";
+import { Session } from "module/auth/session.model";
 
 /**
  * The token is accepted from the handshake `auth` payload or the Authorization
@@ -34,7 +35,8 @@ export const socketAuthMiddleware = async (
     if (!token) return next(new Error("Unauthorized"));
 
     const decoded = verifyJwtToken(token, config.jwt.jwt_secret as Secret);
-    if (decoded.type || !decoded.userId) return next(new Error("Unauthorized"));
+    // A normal session token, or the short-lived token made for sockets; never a password-reset token.
+    if ((decoded.type && decoded.type !== "socket") || !decoded.userId) return next(new Error("Unauthorized"));
 
     const user = await UserRepository.findById(decoded.userId, { populate: "auth" });
     const authDoc = (user?.auth as any) || null;
@@ -55,11 +57,17 @@ export const socketAuthMiddleware = async (
       return next(new Error("Unauthorized: session ended"));
     }
 
+    if (decoded.sid && !(await Session.exists({ _id: decoded.sid }))) {
+      return next(new Error("Unauthorized: session ended"));
+    }
+
     socket.data.userId = String(user._id);
+    socket.data.sid = decoded.sid ? String(decoded.sid) : undefined;
     socket.data.authId = String(authDoc._id);
     socket.data.isSuperAdmin = Boolean(authDoc.isSuperAdmin);
     // Role comes from the database (same rule as the HTTP middleware).
     socket.data.role = authDoc.isSuperAdmin ? "superAdmin" : authDoc.role || "user";
+    socket.data.permissions = authDoc.isSuperAdmin ? ["*"] : authDoc.permissions || [];
     socket.data.approvedHelper = user.helperApplicationStatus === "approved";
 
     next();

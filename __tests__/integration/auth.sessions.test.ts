@@ -48,6 +48,7 @@ import { Auth } from "../../src/module/auth/auth.model";
 import { Session } from "../../src/module/auth/session.model";
 import { User } from "../../src/module/user/user.model";
 import authMiddleware from "../../src/middlewares/auth";
+import { socketAuthMiddleware } from "../../src/socket/socket.auth";
 import { requirePermission, requireStaffPermission } from "../../src/middlewares/auth";
 import createJwtToken from "../../src/jwt/createJwtToken";
 import config from "../../src/config";
@@ -203,6 +204,42 @@ describe("sessions, logout and password changes", () => {
     const { req } = await authorize(res.accessToken);
     await AuthService.logout(req.user.sessionId);
     await expect(AuthService.getAccessToken(res.refreshToken)).rejects.toMatchObject({ statusCode: 401 });
+  });
+
+  it("signing out ends that device's access token at once, not when it expires", async () => {
+    const res: any = await register();
+    const { req } = await authorize(res.accessToken);
+    await AuthService.logout(req.user.sessionId);
+    expect((await authorize(res.accessToken)).error).toMatchObject({ statusCode: 401, code: "SESSION_REVOKED" });
+  });
+
+  it("the dashboard's socket token opens a socket but is useless as an API token", async () => {
+    const res: any = await register();
+    const { req } = await authorize(res.accessToken);
+    const token = AuthService.createSocketToken({
+      userId: String(req.user._id),
+      tokenVersion: req.user.auth.tokenVersion ?? 0,
+      sessionId: req.user.sessionId,
+    });
+
+    expect((await authorize(token)).error).toMatchObject({ statusCode: 401 });
+
+    const socket: any = { handshake: { auth: { token }, headers: {} }, data: {} };
+    let socketError: any = "not called";
+    await socketAuthMiddleware(socket, (e?: any) => {
+      socketError = e;
+    });
+    expect(socketError).toBeUndefined();
+    expect(socket.data.userId).toBe(String(req.user._id));
+
+    // and it dies with the session, like every other token
+    await AuthService.logout(req.user.sessionId);
+    const again: any = { handshake: { auth: { token }, headers: {} }, data: {} };
+    let afterLogout: any;
+    await socketAuthMiddleware(again, (e?: any) => {
+      afterLogout = e;
+    });
+    expect(afterLogout).toBeInstanceOf(Error);
   });
 
   it("a password reset ends every old session and works only once (AU-03/AU-08)", async () => {

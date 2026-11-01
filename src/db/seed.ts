@@ -363,7 +363,7 @@ export const seedHelpersAndUsers = async (categoryMap: Map<string, any>): Promis
 
 export const runSeed = async (): Promise<void> => {
   try {
-    logger.info("🌱 [SEED START] Executing complete Tarik seed routine...");
+    logger.info("🌱 [SEED START] Executing complete 3awniNet seed routine...");
     await seedAdmin();
     const categoryMap = await seedCategories();
     await seedHelpersAndUsers(categoryMap);

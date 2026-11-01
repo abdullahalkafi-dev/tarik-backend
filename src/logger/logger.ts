@@ -6,7 +6,7 @@ import config from "../config";
 const { combine, timestamp, label, printf, errors, colorize } = format;
 
 const LOG_DIR = path.join(process.cwd(), "logs");
-const APP_NAME = config.app_name || "Tarik";
+const APP_NAME = config.app_name || "3awniNet";
 
 const customFormat = printf((info) => {
   const { level, message, label, timestamp, stack } = info;

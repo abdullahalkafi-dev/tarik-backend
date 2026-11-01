@@ -8,24 +8,30 @@ import handleZodError from "../errors/handleZodError";
 import config from "../config";
 import { errorLogger } from "../logger/logger";
 import { TErrorSources } from "../types/error";
+import { checkInputMessage, errorLocaleFromHeader, translateErrorMessage } from "../errors/errorTranslations";
 
 const globalErrorHandler: ErrorRequestHandler = (err, req, res, _next): void => {
   let statusCode = 500;
   let message = "Something went wrong!";
   let errorSources: TErrorSources = [{ path: "", message: "Something went wrong" }];
+  // Form-validation text is built from English field names: it gets a generic line in other languages.
+  let isFormError = false;
 
   if (err instanceof ZodError) {
     const result = handleZodError(err);
+    isFormError = true;
     statusCode = result.statusCode;
     message = result.message;
     errorSources = result.errorSources;
   } else if (err?.name === "ValidationError") {
     const result = handleValidationError(err);
+    isFormError = true;
     statusCode = result.statusCode;
     message = result.message;
     errorSources = result.errorSources;
   } else if (err?.name === "CastError") {
     const result = handleCastError(err);
+    isFormError = true;
     statusCode = result.statusCode;
     message = result.message;
     errorSources = result.errorSources;
@@ -74,7 +80,21 @@ const globalErrorHandler: ErrorRequestHandler = (err, req, res, _next): void => 
 
   res.locals.errorMessage = err.message;
 
-  errorLogger.error(`${req.method} ${req.originalUrl} → ${message}`, {
+  // Answer in the caller's language (the app sends Accept-Language). Logs keep the English text.
+  const logMessage = message;
+  const locale = errorLocaleFromHeader(req.headers["accept-language"]);
+  if (locale !== "en") {
+    // The app shows errorSources[0] first, so an untranslatable form line must not stay English there.
+    const generic = isFormError ? checkInputMessage(locale) : undefined;
+    errorSources = errorSources.map((e) => {
+      const translated = translateErrorMessage(e.message, locale);
+      return { ...e, message: translated !== e.message ? translated : (generic ?? e.message) };
+    });
+    const translated = translateErrorMessage(message, locale);
+    message = translated !== message ? translated : (generic ?? message);
+  }
+
+  errorLogger.error(`${req.method} ${req.originalUrl} → ${logMessage}`, {
     errorSources,
     stack: err?.stack,
     ...(config.node_env === "development" && {

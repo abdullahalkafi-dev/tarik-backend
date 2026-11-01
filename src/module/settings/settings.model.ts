@@ -10,8 +10,8 @@ const localized = {
 
 const platformSettingsSchema = new Schema<TPlatformSettings>(
   {
-    platformName: { type: String, default: "Tarik" },
-    supportEmail: { type: String, default: "support@tarik.ma" },
+    platformName: { type: String, default: "3awniNet" },
+    supportEmail: { type: String, default: "support@3awninet.ma" },
     contactPhone: { type: String, default: "" },
     supportWhatsapp: { type: String, default: "" },
     // The fee applies to money movements; it is snapshotted on every job when

@@ -28,6 +28,7 @@ import { getAllowedOrigins } from "../config/origins";
 import { User } from "../module/user/user.model";
 import { Job } from "../module/job/job.model";
 import { Auth } from "../module/auth/auth.model";
+import { Session } from "../module/auth/session.model";
 import { UserService } from "../module/user/user.service";
 import { haversineKm } from "../util/geo";
 import { isCoordinateInAllowedRegion } from "../util/geo";
@@ -37,6 +38,14 @@ let pubClient: RedisClientType | null = null;
 let subClient: RedisClientType | null = null;
 
 const STAFF_ROLES = ["admin", "superAdmin", "staff"];
+
+/** Staff may only use realtime features their permissions cover (Super Admin / "*" pass). */
+const staffCan = (socket: Socket, ...needed: string[]): boolean => {
+  if (!STAFF_ROLES.includes(String(socket.data.role))) return false;
+  if (socket.data.isSuperAdmin) return true;
+  const held: string[] = socket.data.permissions || [];
+  return held.includes("*") || needed.some((p) => held.includes(p));
+};
 
 type Ack = (response: { ok: boolean; code?: string; message?: string; [k: string]: unknown }) => void;
 
@@ -66,9 +75,27 @@ const safe =
     }
   };
 
-const attachRedisAdapter = async (io: Server) => {
+let adapterRetry: NodeJS.Timeout | null = null;
+
+/**
+ * Attaches the Redis adapter (several API instances share rooms through it).
+ * When Redis is not reachable yet — typical after a server reboot, when the
+ * API wins the race — sockets run on the local adapter meanwhile and this tries
+ * again every 15 s until Redis is there.
+ */
+const attachRedisAdapter = async (io: Server, isRetry = false): Promise<void> => {
+  const retryLater = () => {
+    if (adapterRetry) return;
+    adapterRetry = setTimeout(() => {
+      adapterRetry = null;
+      attachRedisAdapter(io, true).catch(() => undefined);
+    }, 15_000);
+    adapterRetry.unref?.();
+  };
+
   if (!redisClient.isAvailable()) {
-    logger.warn("Socket.IO Redis adapter disabled: Redis is unavailable");
+    if (!isRetry) logger.warn("Socket.IO Redis adapter not attached yet: Redis is unavailable, will retry");
+    retryLater();
     return;
   }
 
@@ -81,9 +108,33 @@ const attachRedisAdapter = async (io: Server) => {
   pubClient.on("error", (e: Error) => logger.warn(`[SOCKET] adapter pub error: ${e.message}`));
   subClient.on("error", (e: Error) => logger.warn(`[SOCKET] adapter sub error: ${e.message}`));
 
-  await Promise.all([pubClient.connect(), subClient.connect()]);
+  try {
+    await Promise.all([pubClient.connect(), subClient.connect()]);
+  } catch (error) {
+    logger.warn(`[SOCKET] adapter connect failed: ${error instanceof Error ? error.message : error}`);
+    await Promise.allSettled([
+      pubClient.isOpen ? pubClient.disconnect() : undefined,
+      subClient.isOpen ? subClient.disconnect() : undefined,
+    ]);
+    pubClient = null;
+    subClient = null;
+    retryLater();
+    return;
+  }
+  // Swapping the adapter forgets the rooms of sockets that are already connected
+  // (their private user room, chats…), so note them first and register them again.
+  // Nobody is disconnected: a client dropped by the server would NOT reconnect by itself.
+  const roomsBefore = new Map<string, Set<string>>();
+  for (const [id, socket] of io.sockets.sockets) roomsBefore.set(id, new Set(socket.rooms));
+
   io.adapter(createAdapter(pubClient, subClient));
   logger.info("Socket.IO Redis adapter enabled");
+
+  if (roomsBefore.size > 0) {
+    const adapter = io.of("/").adapter;
+    for (const [id, rooms] of roomsBefore) adapter.addAll(id, rooms);
+    logger.info(`[SOCKET] adapter attached late: kept the rooms of ${roomsBefore.size} connected client(s)`);
+  }
 };
 
 /** Is `userId` a participant of the conversation? (one DB read, then cached per socket) */
@@ -139,11 +190,18 @@ export const initializeSocketServer = async (server: http.Server) => {
     // re-check regularly (explicit bans also disconnect immediately).
     const recheck = setInterval(async () => {
       try {
-        const [auth, user] = await Promise.all([
-          Auth.findById(authId).select("isDeleted isBlacklisted status tokenVersion").lean(),
+        const sid = socket.data.sid as string | undefined;
+        const [auth, user, sessionAlive] = await Promise.all([
+          Auth.findById(authId).select("isDeleted isBlacklisted status tokenVersion isSuperAdmin permissions").lean(),
           User.findById(userId).select("isBlocked isDeleted").lean(),
+          sid ? Session.exists({ _id: sid }) : Promise.resolve(true),
         ]);
+        if (auth) {
+          // Staff permission changes apply to the open socket too.
+          socket.data.permissions = auth.isSuperAdmin ? ["*"] : (auth as any).permissions || [];
+        }
         if (
+          !sessionAlive ||
           !auth ||
           auth.isDeleted ||
           auth.isBlacklisted ||
@@ -271,8 +329,7 @@ export const initializeSocketServer = async (server: http.Server) => {
         const { SupportTicket } = await import("../module/support/support.model");
         const ticket = await SupportTicket.findById(ticketId).select("user").lean();
         if (!ticket) return ack?.({ ok: false, code: "NOT_FOUND" });
-        const isAdmin = STAFF_ROLES.includes(String(socket.data.role));
-        if (isAdmin || String(ticket.user) === userId) {
+        if (staffCan(socket, "support.manage") || String(ticket.user) === userId) {
           socket.join(`support:${ticketId}`);
           return ack?.({ ok: true });
         }
@@ -288,7 +345,7 @@ export const initializeSocketServer = async (server: http.Server) => {
     );
 
     // Staff watch the support inbox in real time instead of polling.
-    if (STAFF_ROLES.includes(String(socket.data.role))) {
+    if (staffCan(socket, "support.manage")) {
       socket.join("support:admins");
     }
 
@@ -324,6 +381,16 @@ export const initializeSocketServer = async (server: http.Server) => {
       return ok;
     };
 
+    // Tell the helper WHY their position is not being shared (once per reason every 5 min),
+    // so "tracking does not work" is never a silent mystery.
+    const rejectedAt = new Map<string, number>();
+    const rejectPing = (reason: "out_of_area" | "not_approved" | "off_duty") => {
+      const now = Date.now();
+      if (now - (rejectedAt.get(reason) || 0) < 5 * 60_000) return;
+      rejectedAt.set(reason, now);
+      socket.emit("helper:location_rejected", { reason });
+    };
+
     socket.on(
       "helper:location_ping",
       safe("helper:location_ping", async (data: any) => {
@@ -333,17 +400,18 @@ export const initializeSocketServer = async (server: http.Server) => {
 
         const lat = Number(data?.latitude);
         const lon = Number(data?.longitude);
-        if (!Number.isFinite(lat) || !Number.isFinite(lon) || !isCoordinateInAllowedRegion(lat, lon)) return;
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+        if (!isCoordinateInAllowedRegion(lat, lon)) return rejectPing("out_of_area");
 
         const state = await helperState();
-        if (!state.ok) return;
+        if (!state.ok) return rejectPing("not_approved");
 
         let jobId: string | undefined;
         if (typeof data?.jobId === "string" && /^[0-9a-fA-F]{24}$/.test(data.jobId)) {
           if (await jobAllowed(data.jobId)) jobId = data.jobId;
         }
         // Without a live job, only helpers who are "on duty" are tracked.
-        if (!jobId && !state.available) return;
+        if (!jobId && !state.available) return rejectPing("off_duty");
 
         const clamp = (v: unknown, min: number, max: number) => {
           const n = Number(v);
@@ -379,7 +447,7 @@ export const initializeSocketServer = async (server: http.Server) => {
         const job = await Job.findById(jobId).select("postedBy assignedTo status").lean();
         if (!job) return ack?.({ ok: false, code: "NOT_FOUND" });
 
-        const isAdmin = STAFF_ROLES.includes(String(socket.data.role));
+        const isAdmin = staffCan(socket, "map.view", "jobs.view");
         const isParticipant = String(job.postedBy) === userId || String(job.assignedTo) === userId;
         if (!isAdmin && !isParticipant) return ack?.({ ok: false, code: "FORBIDDEN" });
 
@@ -421,6 +489,10 @@ export const initializeSocketServer = async (server: http.Server) => {
 };
 
 export const closeSocketServer = async () => {
+  if (adapterRetry) {
+    clearTimeout(adapterRetry);
+    adapterRetry = null;
+  }
   SocketPresenceService.stopHeartbeat();
   await Promise.all([
     pubClient?.isOpen ? pubClient.disconnect() : undefined,

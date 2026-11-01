@@ -1,9 +1,8 @@
 import { PlatformSettings, SettingsHistory } from "./settings.model";
 import { TPlatformSettings } from "./settings.interface";
+import { defaultLegalText } from "./legalDefaults";
 
 const LEGACY_DEFAULTS = {
-  platformName: "3awniNet",
-  supportEmail: "support@3awninet.ma",
   contactPhone: "+212 522 00 00 00",
 };
 
@@ -11,8 +10,8 @@ const getSettings = async (): Promise<TPlatformSettings> => {
   let settings = await PlatformSettings.findOne();
   if (!settings) {
     settings = await PlatformSettings.create({
-      platformName: "Tarik",
-      supportEmail: "support@tarik.ma",
+      platformName: "3awniNet",
+      supportEmail: "support@3awninet.ma",
       contactPhone: "",
       platformFeePercentage: 20,
       minimumServiceAmount: 30,
@@ -29,17 +28,9 @@ const getSettings = async (): Promise<TPlatformSettings> => {
     });
   }
 
-  // Backfill new fields on older documents and retire the old placeholder brand.
+  // Backfill new fields on older documents and retire the old placeholder phone.
   let dirty = false;
   const s = settings as any;
-  if (s.platformName === LEGACY_DEFAULTS.platformName) {
-    s.platformName = "Tarik";
-    dirty = true;
-  }
-  if (s.supportEmail === LEGACY_DEFAULTS.supportEmail) {
-    s.supportEmail = "support@tarik.ma";
-    dirty = true;
-  }
   if (s.contactPhone === LEGACY_DEFAULTS.contactPhone) {
     s.contactPhone = "";
     dirty = true;
@@ -192,7 +183,10 @@ const pickLegalText = (
   const hidden = (v?: string) => !v || /update from Admin/i.test(v);
   const localized = settings.legal?.translations?.[kind]?.[lang];
   const text = !hidden(localized) ? localized : settings.legal?.[kind];
-  return hidden(text) ? "" : text;
+  // Nothing entered in the dashboard yet: fall back to the built-in text.
+  return hidden(text)
+    ? defaultLegalText(kind, lang, { app: settings.platformName, email: settings.supportEmail })
+    : text;
 };
 
 /** Public values the mobile app may need (no secrets). */

@@ -4,7 +4,7 @@ import path from "path";
 dotenv.config({ path: path.join(process.cwd(), ".env") });
 
 export default {
-  app_name: process.env.APP_NAME || "Tarik",
+  app_name: process.env.APP_NAME || "3awniNet",
   // Unknown environments behave like production (no stack traces, no body logging).
   node_env: process.env.NODE_ENV || "production",
   port: process.env.PORT || "5000",

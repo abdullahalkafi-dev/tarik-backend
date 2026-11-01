@@ -44,6 +44,22 @@ const logout = catchAsync(async (req, res) => {
   });
 });
 
+const socketToken = catchAsync(async (req, res) => {
+  const user = req.user as any;
+  const token = AuthService.createSocketToken({
+    userId: String(user._id),
+    tokenVersion: user.auth?.tokenVersion ?? 0,
+    sessionId: user.sessionId,
+  });
+
+  sendResponse(res, {
+    statusCode: StatusCodes.OK,
+    success: true,
+    message: "Socket token",
+    data: { token },
+  });
+});
+
 const logoutAll = catchAsync(async (req, res) => {
   const result = await AuthService.logoutAll(authIdOf(req));
 
@@ -154,6 +170,7 @@ export const AuthController = {
   getAccessToken,
   logout,
   logoutAll,
+  socketToken,
   changePassword,
   // Phone auth
   registerWithPhone,
