@@ -61,10 +61,12 @@ const sendUpcomingReminders = async (): Promise<number> => {
       { $set: { reminderSentAt: new Date() } },
     );
     if (!claimed.modifiedCount) continue;
-    const time = new Date(j.startAt as Date).toLocaleTimeString("fr-MA", {
+    // 12-hour with Latin AM/PM, like everywhere else in the product ("2:30 PM").
+    const time = new Date(j.startAt as Date).toLocaleTimeString("en-US", {
       timeZone: BUSINESS_TZ,
-      hour: "2-digit",
+      hour: "numeric",
       minute: "2-digit",
+      hour12: true,
     });
     for (const uid of [j.postedBy, j.assignedTo].filter(Boolean)) {
       notifyUserT(String(uid), "job.reminder_soon", { title: j.title, time }, { type: "job_reminder", jobId: String(j._id) }).catch(
